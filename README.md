@@ -1,57 +1,59 @@
-# BIU Grade Watcher
+# BIU Grade Watcher v9
 
 Cross-platform BIU In-Bar grade monitoring for Windows and Linux.
 
-## Supported Platforms
+## Important design principle
 
-- Windows 10 and Windows 11
-- Linux desktop distributions with Python 3.8 or newer
+This version reduces the risk of accidental rate limiting or blocking. It does
+**not** try to make Playwright undetectable, spoof a browser fingerprint, solve
+CAPTCHAs, or bypass BIU security controls.
 
-## Platform Detection
+When BIU returns a blocking response or human-verification challenge, the
+watcher pauses automatically and does not keep retrying.
 
-The same Python file runs on both systems.
+## Protection mechanisms
 
-The watcher detects the operating system automatically and selects:
-
-| Feature | Windows | Linux |
-|---|---|---|
-| Grade monitoring | Playwright | Playwright |
-| Direct login | Headless Chromium | Headless Chromium |
-| Notifications | Native MessageBox | `notify-send` |
-| Snapshot storage | Local JSON | Local JSON |
-| Application directory | `%LOCALAPPDATA%\BIUGradeWatcher` | `$XDG_DATA_HOME/biu-grade-watcher` or `~/.local/share/biu-grade-watcher` |
-
-If `notify-send` is not available on Linux, notifications are printed to the terminal.
+- Persistent Chromium profile and session.
+- One running watcher instance per user.
+- No parallel BIU operations.
+- Minimum spacing between top-level requests.
+- Hourly request budget.
+- Random jitter around check and keepalive times.
+- Detection of HTTP `403`, `406`, `418`, `423`, and `429`.
+- Detection of blocking, CAPTCHA, and rate-limit page text.
+- `Retry-After` support.
+- Persistent `CLOSED`, `OPEN`, and `HALF_OPEN` circuit breaker.
+- Exactly one controlled recovery probe after cooldown.
+- Exponential backoff for transient server/network failures.
+- Authentication attempt budget.
+- No repeated automatic OTP attempts.
+- Keepalive uses `fetch()` inside the authenticated browser context.
+- No stealth or fingerprint-spoofing browser flags.
 
 ## Installation
 
 ### Windows
 
 ```powershell
-py -3.8 -m pip install playwright
+py -3.8 -m pip install -r requirements.txt
 py -3.8 -m playwright install chromium
 ```
 
 ### Linux
 
 ```bash
-python3 -m pip install playwright
+python3 -m pip install -r requirements.txt
 python3 -m playwright install chromium
-```
-
-Install Linux browser dependencies when required:
-
-```bash
 python3 -m playwright install-deps chromium
 ```
 
-For desktop notifications on Debian or Ubuntu:
+Desktop notifications on Debian/Ubuntu:
 
 ```bash
 sudo apt install libnotify-bin
 ```
 
-## Environment File
+## Environment file
 
 Create `.env` next to the script:
 
@@ -60,14 +62,18 @@ BIU_ID=123456789
 BIU_PHONE=0501234567
 ```
 
-Alternative variable names are also supported:
+Alternative names remain supported:
 
 ```env
 id=123456789
 phonenumber=0501234567
 ```
 
-## Windows Usage
+The OTP is entered interactively and is not stored.
+
+## Recommended command
+
+### Windows
 
 ```powershell
 py -3.8 biu_grade_watcher.py `
@@ -76,7 +82,7 @@ py -3.8 biu_grade_watcher.py `
     --keepalive 2
 ```
 
-## Linux Usage
+### Linux
 
 ```bash
 python3 biu_grade_watcher.py \
@@ -85,7 +91,10 @@ python3 biu_grade_watcher.py \
     --keepalive 2
 ```
 
-## One-Time Test
+The actual schedule includes small random jitter to avoid synchronized request
+bursts.
+
+## One-time test
 
 ### Windows
 
@@ -107,27 +116,45 @@ python3 biu_grade_watcher.py \
     --print-rows
 ```
 
-## Manual My Bar-Ilan Login
-
-### Windows
+## Protection status
 
 ```powershell
-py -3.8 biu_grade_watcher.py `
-    --auth-method my-biu `
-    --force-login
+py -3.8 biu_grade_watcher.py --protection-status
 ```
 
-### Linux
+or:
 
 ```bash
-python3 biu_grade_watcher.py \
-    --auth-method my-biu \
-    --force-login
+python3 biu_grade_watcher.py --protection-status
 ```
 
-A visible Chromium browser is required for the manual portal login.
+Example:
 
-## Stored Data
+```json
+{
+  "circuit_state": "OPEN",
+  "consecutive_failures": 0,
+  "opened_count": 1,
+  "cooldown_until": "2026-07-24T18:00:00+00:00",
+  "last_reason": "grade check returned HTTP 429.",
+  "last_status": 429,
+  "seconds_until_probe": 1620
+}
+```
+
+## Clearing the protection state
+
+Only clear it after confirming that BIU is accessible normally in a regular
+browser:
+
+```powershell
+py -3.8 biu_grade_watcher.py --clear-protection-state
+```
+
+The state is intentionally persistent. Restarting the script does not erase a
+cooldown after a `403`, `429`, CAPTCHA, or blocking page.
+
+## Stored data
 
 ### Windows
 
@@ -147,60 +174,38 @@ or:
 ~/.local/share/biu-grade-watcher
 ```
 
-The directory contains:
+Files:
 
 ```text
 browser_profile/
 grade_snapshot.json
+protection_state.json
 watcher.log
+watcher.lock
 ```
 
-## Reset the Grade Snapshot
+## Safety limits
 
-### Windows
-
-```powershell
-py -3.8 biu_grade_watcher.py --reset
-```
-
-### Linux
-
-```bash
-python3 biu_grade_watcher.py --reset
-```
-
-## Linux Notification Test
-
-```bash
-notify-send "BIU Grade Watcher" "Notification test"
-```
-
-If this command is unavailable:
-
-```bash
-sudo apt install libnotify-bin
-```
-
-## Security
-
-Do not commit or upload:
+The defaults are deliberately conservative:
 
 ```text
-.env
-browser_profile/
-grade_snapshot.json
-watcher.log
+Grade check interval: 10 minutes
+Keepalive interval: 2 minutes
+Minimum top-level request gap: 12 seconds
+Maximum top-level operations: 45 per hour
 ```
 
-Recommended `.gitignore`:
+The script refuses a grade interval below 5 minutes, a keepalive interval below
+2 minutes, or more than 60 top-level operations per hour.
 
-```gitignore
-.env
-browser_profile/
-grade_snapshot.json
-watcher.log
-__pycache__/
-*.pyc
-```
+## What happens after a block
 
-The OTP is entered interactively and is not saved.
+1. The watcher records the reason and status.
+2. The circuit changes to `OPEN`.
+3. Keepalive and grade checks pause.
+4. The cooldown survives process restarts.
+5. After the cooldown, one `HALF_OPEN` recovery probe is allowed.
+6. Success closes the circuit.
+7. Failure reopens it with a longer cooldown.
+
+The watcher does not attempt to bypass the restriction.

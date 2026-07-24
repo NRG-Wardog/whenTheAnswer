@@ -2,40 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-BIU In-Bar Grade Watcher v8
+BIU In-Bar Grade Watcher v9
 Cross-platform: Windows and Linux
 Python 3.8+
 
-Authentication modes
---------------------
-1. direct
-   - Fully headless.
-   - Reads ID and phone from environment variables or .env.
-   - Fills the direct In-Bar login form automatically.
-   - Prompts for the one-time verification code in the terminal.
-   - Submits the OTP inside the same headless browser context.
-
-2. my-biu
-   - Opens the "My Bar-Ilan" portal in a visible Chromium browser.
-   - The user completes authentication manually.
-   - The watcher detects successful authentication automatically.
-
-Session TTL
------------
-BIU sessions may expire quickly when idle. A lightweight authenticated
-keepalive request runs independently from the grade-check interval.
-
-Platform support
-----------------
-Windows:
-- Native MessageBox notifications.
-- Data stored under %LOCALAPPDATA%\\BIUGradeWatcher.
-
-Linux:
-- Desktop notifications through notify-send when available.
-- Falls back to terminal output if notify-send is unavailable.
-- Data stored under $XDG_DATA_HOME/biu-grade-watcher or
-  ~/.local/share/biu-grade-watcher.
+Design goals
+------------
+- Conservative request pacing.
+- Persistent browser profile and authenticated session.
+- No CAPTCHA bypass, fingerprint spoofing, or anti-bot circumvention.
+- Immediate detection of explicit blocking and rate limiting.
+- Persistent circuit breaker with one controlled recovery probe.
+- Exponential backoff for transient failures.
+- Retry-After support.
+- Randomized scheduling jitter to spread load.
+- A single running instance per user.
+- No storage of OTP values.
 """
 
 from __future__ import annotations
@@ -47,23 +29,32 @@ import hashlib
 import json
 import os
 import platform
+import random
 import re
 import shutil
 import subprocess
-import tempfile
 import traceback
-from datetime import datetime
+from collections import deque
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Set, Tuple
 
 from playwright.async_api import (
     BrowserContext,
     Locator,
     Page,
+    Response,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
 
+
+# ---------------------------------------------------------------------------
+# BIU endpoints and page identifiers
+# ---------------------------------------------------------------------------
 
 TARGET_URL = (
     "https://inbar.biu.ac.il/Live/"
@@ -78,16 +69,46 @@ DIRECT_LOGIN_URL = (
 MY_BIU_URL = "https://my.biu.ac.il/"
 
 TARGET_PATH = "StudentAssignmentTermList.aspx"
+LOGIN_PATH = "Login.aspx"
 TABLE_HINT = "gvStudentAssignmentTermList"
 
-APP_NAME_WINDOWS = "BIUGradeWatcher"
-APP_NAME_LINUX = "biu-grade-watcher"
+
+# ---------------------------------------------------------------------------
+# Conservative defaults
+# ---------------------------------------------------------------------------
 
 DEFAULT_INTERVAL_MINUTES = 10
 DEFAULT_KEEPALIVE_MINUTES = 2
+
+MIN_GRADE_INTERVAL_MINUTES = 5
+MIN_KEEPALIVE_INTERVAL_MINUTES = 2
+
+DEFAULT_REQUEST_MIN_GAP_SECONDS = 12
+DEFAULT_MAX_TOP_LEVEL_REQUESTS_PER_HOUR = 45
+
+GRADE_JITTER_RATIO = 0.10
+KEEPALIVE_JITTER_RATIO = 0.15
+
+TRANSIENT_FAILURE_THRESHOLD = 3
+TRANSIENT_BACKOFF_BASE_SECONDS = 60
+TRANSIENT_BACKOFF_MAX_SECONDS = 60 * 60
+
+RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS = 30 * 60
+EXPLICIT_BLOCK_DEFAULT_COOLDOWN_SECONDS = 6 * 60 * 60
+
+MAX_REAUTH_ATTEMPTS_PER_HOUR = 2
+MIN_REAUTH_GAP_SECONDS = 10 * 60
+
 LOGIN_TIMEOUT_SECONDS = 15 * 60
 LOGIN_POLL_SECONDS = 2
 ROW_STABILITY_ROUNDS = 3
+
+PROTECTION_NOTIFICATION_COOLDOWN_SECONDS = 60 * 60
+
+
+# ---------------------------------------------------------------------------
+# Table headers
+# ---------------------------------------------------------------------------
 
 GRADE_HEADER_NAMES = {"ציון", "ציון סופי"}
 COURSE_HEADER_NAMES = {"שם קבוצת קורס", "שם הקורס", "קורס"}
@@ -95,6 +116,55 @@ COURSE_CODE_HEADER_NAMES = {"קוד קבוצת קורס", "קוד קורס", "מ
 DATE_HEADER_NAMES = {"תאריך", "תאריך בחינה"}
 TERM_HEADER_NAMES = {"מועד", "תקופה"}
 NOTEBOOK_HEADER_NAMES = {"מספר מחברת", "מחברת"}
+
+
+# ---------------------------------------------------------------------------
+# Block/challenge detection
+# ---------------------------------------------------------------------------
+
+BLOCK_STATUSES = {403, 406, 418, 423}
+RATE_LIMIT_STATUSES = {429}
+AUTH_STATUSES = {401}
+TRANSIENT_STATUSES = {408, 425, 500, 502, 503, 504}
+
+BLOCK_TEXT_PATTERNS = (
+    "access denied",
+    "request blocked",
+    "temporarily blocked",
+    "your request has been blocked",
+    "unusual traffic",
+    "automated requests",
+    "verify you are human",
+    "security challenge",
+    "bot detection",
+    "captcha",
+    "forbidden",
+    "הגישה נדחתה",
+    "הבקשה נחסמה",
+    "נחסמת",
+    "אימות אנושי",
+    "אימות שאתה אנושי",
+    "אינך מורשה",
+    "קפצ'ה",
+)
+
+RATE_LIMIT_TEXT_PATTERNS = (
+    "too many requests",
+    "rate limit",
+    "retry later",
+    "request limit",
+    "יותר מדי בקשות",
+    "חרגת ממספר הבקשות",
+    "נסה שוב מאוחר יותר",
+)
+
+
+# ---------------------------------------------------------------------------
+# Platform paths
+# ---------------------------------------------------------------------------
+
+APP_NAME_WINDOWS = "BIUGradeWatcher"
+APP_NAME_LINUX = "biu-grade-watcher"
 
 
 def current_platform() -> str:
@@ -141,52 +211,90 @@ def application_directory() -> Path:
 APP_DIR = application_directory()
 PROFILE_DIR = APP_DIR / "browser_profile"
 SNAPSHOT_FILE = APP_DIR / "grade_snapshot.json"
+PROTECTION_FILE = APP_DIR / "protection_state.json"
 LOG_FILE = APP_DIR / "watcher.log"
+LOCK_FILE = APP_DIR / "watcher.lock"
 
 
-def log(message: str) -> None:
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = "[{}] {}".format(stamp, message)
-    print(line, flush=True)
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
-    try:
-        with LOG_FILE.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-    except Exception:
-        pass
+class WatcherError(RuntimeError):
+    pass
 
 
-def load_dotenv_file(path: Path) -> None:
-    if not path.exists():
-        return
+class SessionExpired(WatcherError):
+    pass
 
-    try:
-        for raw_line in path.read_text(
-            encoding="utf-8-sig"
-        ).splitlines():
-            line = raw_line.strip()
 
-            if not line or line.startswith("#") or "=" not in line:
-                continue
+class TransientFailure(WatcherError):
+    def __init__(self, message: str, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
 
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip()
 
-            if (
-                len(value) >= 2
-                and value[0] == value[-1]
-                and value[0] in {"'", '"'}
-            ):
-                value = value[1:-1]
+class ProtectionEvent(WatcherError):
+    def __init__(
+        self,
+        message: str,
+        kind: str,
+        status: Optional[int] = None,
+        retry_after_seconds: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.status = status
+        self.retry_after_seconds = retry_after_seconds
 
-            if key and key not in os.environ:
-                os.environ[key] = value
 
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not read environment file '{}': {}".format(path, exc)
+class CircuitOpen(WatcherError):
+    def __init__(self, wait_seconds: int, reason: str) -> None:
+        super().__init__(
+            "Protection circuit is open for approximately {} second(s): {}"
+            .format(wait_seconds, reason)
         )
+        self.wait_seconds = wait_seconds
+        self.reason = reason
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_iso(value: Optional[datetime] = None) -> str:
+    current = value or utc_now()
+    return current.isoformat(timespec="seconds")
+
+
+def parse_utc(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.astimezone(timezone.utc)
+
+    except ValueError:
+        return None
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def jittered_seconds(base_seconds: float, ratio: float) -> float:
+    ratio = clamp(ratio, 0.0, 0.5)
+    offset = base_seconds * ratio
+    return max(1.0, random.uniform(base_seconds - offset, base_seconds + offset))
 
 
 def normalize_text(value: Any) -> str:
@@ -213,7 +321,7 @@ def has_meaningful_grade(row: Dict[str, str]) -> bool:
     )
 
 
-def get_first_value(row: Dict[str, str], names: set) -> str:
+def get_first_value(row: Dict[str, str], names: Set[str]) -> str:
     for name in names:
         value = normalize_text(row.get(name, ""))
 
@@ -223,19 +331,19 @@ def get_first_value(row: Dict[str, str], names: set) -> str:
     return ""
 
 
+def log(message: str) -> None:
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = "[{}] {}".format(stamp, message)
+    print(line, flush=True)
+
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except Exception:
+        pass
+
+
 def desktop_notification(title: str, message: str) -> None:
-    """
-    Show a desktop notification using the current operating system.
-
-    Windows:
-        Native MessageBox.
-
-    Linux:
-        notify-send if available.
-
-    Fallback:
-        Console output.
-    """
     try:
         if PLATFORM == "windows":
             MB_OK = 0x00000000
@@ -274,48 +382,534 @@ def desktop_notification(title: str, message: str) -> None:
     log("NOTIFICATION: {} - {}".format(title, message))
 
 
-def read_snapshot() -> Optional[List[Dict[str, str]]]:
-    if not SNAPSHOT_FILE.exists():
-        return None
+async def notify_async(title: str, message: str) -> None:
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, desktop_notification, title, message)
+
+
+def load_dotenv_file(path: Path) -> None:
+    if not path.exists():
+        return
 
     try:
-        data = json.loads(
-            SNAPSHOT_FILE.read_text(encoding="utf-8")
-        )
+        for raw_line in path.read_text(
+            encoding="utf-8-sig"
+        ).splitlines():
+            line = raw_line.strip()
 
-        if not isinstance(data, list):
-            return None
+            if not line or line.startswith("#") or "=" not in line:
+                continue
 
-        return [
-            {
-                normalize_text(key): normalize_text(value)
-                for key, value in item.items()
-            }
-            for item in data
-            if isinstance(item, dict)
-        ]
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+
+            if (
+                len(value) >= 2
+                and value[0] == value[-1]
+                and value[0] in {"'", '"'}
+            ):
+                value = value[1:-1]
+
+            if key and key not in os.environ:
+                os.environ[key] = value
 
     except Exception as exc:
-        log("Could not read the saved snapshot: {}".format(exc))
+        raise RuntimeError(
+            "Could not read environment file '{}': {}".format(path, exc)
+        )
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    except Exception as exc:
+        log("Could not read '{}': {}".format(path, exc))
+        return default
+
+
+def parse_retry_after(
+    raw_value: Optional[str],
+    now: Optional[datetime] = None,
+) -> Optional[int]:
+    if not raw_value:
         return None
+
+    value = raw_value.strip()
+    current = now or utc_now()
+
+    if value.isdigit():
+        return max(0, int(value))
+
+    try:
+        retry_time = parsedate_to_datetime(value)
+
+        if retry_time.tzinfo is None:
+            retry_time = retry_time.replace(tzinfo=timezone.utc)
+
+        seconds = int(
+            (retry_time.astimezone(timezone.utc) - current).total_seconds()
+        )
+        return max(0, seconds)
+
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def text_contains_any(text: str, patterns: Tuple[str, ...]) -> bool:
+    lower = normalize_text(text).lower()
+    return any(pattern.lower() in lower for pattern in patterns)
+
+
+async def sleep_or_stop(
+    stop_event: asyncio.Event,
+    seconds: float,
+) -> bool:
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=max(0.0, seconds))
+        return True
+
+    except asyncio.TimeoutError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Single-instance lock
+# ---------------------------------------------------------------------------
+
+def process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+
+    try:
+        os.kill(pid, 0)
+        return True
+
+    except ProcessLookupError:
+        return False
+
+    except PermissionError:
+        return True
+
+    except OSError:
+        return False
+
+
+class InstanceLock:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.acquired = False
+
+    def acquire(self) -> None:
+        for _ in range(2):
+            try:
+                descriptor = os.open(
+                    str(self.path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps(
+                            {
+                                "pid": os.getpid(),
+                                "created_at": utc_iso(),
+                            }
+                        )
+                    )
+
+                self.acquired = True
+                return
+
+            except FileExistsError:
+                data = read_json(self.path, {})
+                existing_pid = int(data.get("pid", 0) or 0)
+
+                if process_exists(existing_pid):
+                    raise RuntimeError(
+                        "Another BIU Grade Watcher instance is already "
+                        "running with PID {}.".format(existing_pid)
+                    )
+
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+
+        raise RuntimeError("Could not acquire the watcher instance lock.")
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+
+        try:
+            data = read_json(self.path, {})
+
+            if int(data.get("pid", 0) or 0) == os.getpid():
+                self.path.unlink()
+
+        except FileNotFoundError:
+            pass
+
+        finally:
+            self.acquired = False
+
+    def __enter__(self) -> "InstanceLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.release()
+
+
+# ---------------------------------------------------------------------------
+# Persistent circuit breaker
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProtectionState:
+    circuit_state: str = "CLOSED"
+    consecutive_failures: int = 0
+    opened_count: int = 0
+    cooldown_until: Optional[str] = None
+    last_reason: str = ""
+    last_status: Optional[int] = None
+    last_event_at: Optional[str] = None
+    last_notification_at: Optional[str] = None
+    half_open_probe_used: bool = False
+
+
+class ProtectionController:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.state = self._load()
+        self._lock = asyncio.Lock()
+
+    def _load(self) -> ProtectionState:
+        raw = read_json(self.path, {})
+
+        if not isinstance(raw, dict):
+            return ProtectionState()
+
+        allowed = set(ProtectionState.__dataclass_fields__.keys())
+        filtered = {
+            key: value
+            for key, value in raw.items()
+            if key in allowed
+        }
+
+        try:
+            state = ProtectionState(**filtered)
+        except TypeError:
+            state = ProtectionState()
+
+        if state.circuit_state not in {"CLOSED", "OPEN", "HALF_OPEN"}:
+            state.circuit_state = "CLOSED"
+
+        return state
+
+    def save(self) -> None:
+        atomic_write_json(self.path, asdict(self.state))
+
+    def status_dict(self) -> Dict[str, Any]:
+        payload = asdict(self.state)
+        payload["seconds_until_probe"] = self.seconds_until_probe()
+        return payload
+
+    def seconds_until_probe(self) -> int:
+        cooldown = parse_utc(self.state.cooldown_until)
+
+        if cooldown is None:
+            return 0
+
+        return max(0, int((cooldown - utc_now()).total_seconds()))
+
+    async def prepare_activity(self, allow_recovery_probe: bool) -> None:
+        async with self._lock:
+            if self.state.circuit_state == "CLOSED":
+                return
+
+            remaining = self.seconds_until_probe()
+
+            if self.state.circuit_state == "OPEN":
+                if remaining > 0:
+                    raise CircuitOpen(remaining, self.state.last_reason)
+
+                if not allow_recovery_probe:
+                    raise CircuitOpen(60, self.state.last_reason)
+
+                self.state.circuit_state = "HALF_OPEN"
+                self.state.half_open_probe_used = False
+                self.save()
+
+            if self.state.circuit_state == "HALF_OPEN":
+                if not allow_recovery_probe:
+                    raise CircuitOpen(60, self.state.last_reason)
+
+                # A HALF_OPEN probe represents one serialized recovery
+                # workflow, not one individual HTTP navigation. The request
+                # gate prevents another workflow from running concurrently.
+                return
+
+    async def record_success(self) -> None:
+        async with self._lock:
+            was_protected = self.state.circuit_state != "CLOSED"
+
+            self.state.circuit_state = "CLOSED"
+            self.state.consecutive_failures = 0
+            self.state.opened_count = 0
+            self.state.cooldown_until = None
+            self.state.last_reason = ""
+            self.state.last_status = None
+            self.state.half_open_probe_used = False
+            self.save()
+
+            if was_protected:
+                log("Protection circuit closed after a successful recovery.")
+
+    async def record_transient_failure(
+        self,
+        reason: str,
+        status: Optional[int] = None,
+    ) -> int:
+        async with self._lock:
+            self.state.consecutive_failures += 1
+            self.state.last_reason = reason
+            self.state.last_status = status
+            self.state.last_event_at = utc_iso()
+
+            should_open = (
+                self.state.circuit_state == "HALF_OPEN"
+                or self.state.consecutive_failures
+                >= TRANSIENT_FAILURE_THRESHOLD
+            )
+
+            if not should_open:
+                self.save()
+                return 0
+
+            exponent = max(
+                0,
+                self.state.consecutive_failures
+                - TRANSIENT_FAILURE_THRESHOLD,
+            )
+
+            cooldown = min(
+                TRANSIENT_BACKOFF_MAX_SECONDS,
+                TRANSIENT_BACKOFF_BASE_SECONDS * (2 ** exponent),
+            )
+
+            cooldown = int(jittered_seconds(cooldown, 0.20))
+            self._open_unlocked(reason, status, cooldown)
+            return cooldown
+
+    async def record_protection_event(
+        self,
+        event: ProtectionEvent,
+    ) -> int:
+        async with self._lock:
+            if event.retry_after_seconds is not None:
+                cooldown = event.retry_after_seconds
+
+            elif event.kind == "rate_limit":
+                cooldown = RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS
+
+            else:
+                cooldown = EXPLICIT_BLOCK_DEFAULT_COOLDOWN_SECONDS
+
+            # Repeated explicit events increase the cooldown, but remain capped.
+            multiplier = min(4, max(1, self.state.opened_count + 1))
+            cooldown = min(24 * 60 * 60, cooldown * multiplier)
+            cooldown = int(jittered_seconds(cooldown, 0.10))
+
+            self._open_unlocked(
+                str(event),
+                event.status,
+                cooldown,
+            )
+            return cooldown
+
+    def _open_unlocked(
+        self,
+        reason: str,
+        status: Optional[int],
+        cooldown_seconds: int,
+    ) -> None:
+        self.state.circuit_state = "OPEN"
+        self.state.opened_count += 1
+        self.state.cooldown_until = utc_iso(
+            utc_now() + timedelta(seconds=max(60, cooldown_seconds))
+        )
+        self.state.last_reason = reason
+        self.state.last_status = status
+        self.state.last_event_at = utc_iso()
+        self.state.half_open_probe_used = False
+        self.save()
+
+        log(
+            "Protection circuit opened for approximately {} minute(s): {}"
+            .format(max(1, cooldown_seconds // 60), reason)
+        )
+
+    async def should_notify(self) -> bool:
+        async with self._lock:
+            previous = parse_utc(self.state.last_notification_at)
+
+            if previous is not None:
+                elapsed = (utc_now() - previous).total_seconds()
+
+                if elapsed < PROTECTION_NOTIFICATION_COOLDOWN_SECONDS:
+                    return False
+
+            self.state.last_notification_at = utc_iso()
+            self.save()
+            return True
+
+    def clear(self) -> None:
+        self.state = ProtectionState()
+        self.save()
+
+
+# ---------------------------------------------------------------------------
+# Request pacing and hourly request budget
+# ---------------------------------------------------------------------------
+
+class RequestGate:
+    """
+    Serializes top-level BIU operations.
+
+    This does not count every browser subresource. It prevents the watcher's
+    explicit reload, navigation, and keepalive operations from overlapping or
+    occurring too aggressively.
+    """
+
+    def __init__(
+        self,
+        minimum_gap_seconds: int,
+        maximum_requests_per_hour: int,
+    ) -> None:
+        self.minimum_gap_seconds = minimum_gap_seconds
+        self.maximum_requests_per_hour = maximum_requests_per_hour
+        self._lock = asyncio.Lock()
+        self._timestamps: Deque[float] = deque()
+        self._last_started_at = 0.0
+
+    @asynccontextmanager
+    async def slot(self, label: str) -> AsyncIterator[None]:
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+
+            while self._timestamps and now - self._timestamps[0] >= 3600:
+                self._timestamps.popleft()
+
+            if len(self._timestamps) >= self.maximum_requests_per_hour:
+                wait_seconds = 3600 - (now - self._timestamps[0])
+                wait_seconds = max(1.0, wait_seconds)
+
+                log(
+                    "Hourly request budget reached. Waiting {:.0f} second(s)."
+                    .format(wait_seconds)
+                )
+                await asyncio.sleep(wait_seconds)
+                now = loop.time()
+
+                while self._timestamps and now - self._timestamps[0] >= 3600:
+                    self._timestamps.popleft()
+
+            gap_remaining = (
+                self.minimum_gap_seconds
+                - (now - self._last_started_at)
+            )
+
+            if gap_remaining > 0:
+                await asyncio.sleep(
+                    jittered_seconds(gap_remaining, 0.10)
+                )
+
+            started = loop.time()
+            self._last_started_at = started
+            self._timestamps.append(started)
+
+            log("Starting paced BIU operation: {}.".format(label))
+            yield
+
+
+# ---------------------------------------------------------------------------
+# Authentication attempt budget
+# ---------------------------------------------------------------------------
+
+class AuthenticationBudget:
+    def __init__(self) -> None:
+        self._attempts: Deque[float] = deque()
+        self._last_attempt_at = 0.0
+
+    def record_or_raise(self, initial_login: bool = False) -> None:
+        now = asyncio.get_running_loop().time()
+
+        while self._attempts and now - self._attempts[0] >= 3600:
+            self._attempts.popleft()
+
+        if len(self._attempts) >= MAX_REAUTH_ATTEMPTS_PER_HOUR:
+            raise ProtectionEvent(
+                "Automatic authentication attempt budget exhausted.",
+                kind="rate_limit",
+                retry_after_seconds=60 * 60,
+            )
+
+        if (
+            not initial_login
+            and self._last_attempt_at > 0
+            and now - self._last_attempt_at < MIN_REAUTH_GAP_SECONDS
+        ):
+            remaining = int(
+                MIN_REAUTH_GAP_SECONDS - (now - self._last_attempt_at)
+            )
+            raise ProtectionEvent(
+                "Authentication was requested again too soon.",
+                kind="rate_limit",
+                retry_after_seconds=remaining,
+            )
+
+        self._attempts.append(now)
+        self._last_attempt_at = now
+
+
+# ---------------------------------------------------------------------------
+# Snapshot handling
+# ---------------------------------------------------------------------------
+
+def read_snapshot() -> Optional[List[Dict[str, str]]]:
+    data = read_json(SNAPSHOT_FILE, None)
+
+    if not isinstance(data, list):
+        return None
+
+    return [
+        {
+            normalize_text(key): normalize_text(value)
+            for key, value in item.items()
+        }
+        for item in data
+        if isinstance(item, dict)
+    ]
 
 
 def write_snapshot(rows: List[Dict[str, str]]) -> None:
-    """
-    Write the snapshot atomically.
-
-    A temporary file is written first and then replaced to avoid corrupting
-    the state if the process is interrupted during a write.
-    """
-    payload = json.dumps(
-        rows,
-        ensure_ascii=False,
-        indent=2,
-    )
-
-    temp_path = SNAPSHOT_FILE.with_suffix(".tmp")
-    temp_path.write_text(payload, encoding="utf-8")
-    temp_path.replace(SNAPSHOT_FILE)
+    atomic_write_json(SNAPSHOT_FILE, rows)
 
 
 def reset_snapshot() -> None:
@@ -454,6 +1048,201 @@ def compare_snapshots(
     return changes
 
 
+# ---------------------------------------------------------------------------
+# Page and response inspection
+# ---------------------------------------------------------------------------
+
+async def page_text_sample(page: Page, limit: int = 10000) -> str:
+    try:
+        return await page.evaluate(
+            """
+            limit => {
+                const body = document.body;
+                if (!body) return "";
+                return (body.innerText || body.textContent || "")
+                    .slice(0, limit);
+            }
+            """,
+            limit,
+        )
+
+    except Exception:
+        return ""
+
+
+async def response_retry_after(response: Optional[Response]) -> Optional[int]:
+    if response is None:
+        return None
+
+    try:
+        headers = await response.all_headers()
+        return parse_retry_after(headers.get("retry-after"))
+
+    except Exception:
+        return None
+
+
+async def inspect_loaded_page(
+    page: Page,
+    response: Optional[Response],
+    *,
+    allow_login_page: bool,
+    operation: str,
+) -> None:
+    status = response.status if response is not None else None
+    retry_after = await response_retry_after(response)
+
+    if status in RATE_LIMIT_STATUSES:
+        raise ProtectionEvent(
+            "{} returned HTTP {}.".format(operation, status),
+            kind="rate_limit",
+            status=status,
+            retry_after_seconds=retry_after,
+        )
+
+    if status in BLOCK_STATUSES:
+        raise ProtectionEvent(
+            "{} returned HTTP {}.".format(operation, status),
+            kind="blocked",
+            status=status,
+            retry_after_seconds=retry_after,
+        )
+
+    if status in AUTH_STATUSES:
+        raise SessionExpired(
+            "{} returned HTTP {}.".format(operation, status)
+        )
+
+    if status in TRANSIENT_STATUSES:
+        if status == 503 and retry_after is not None:
+            raise ProtectionEvent(
+                "{} returned HTTP 503 with Retry-After."
+                .format(operation),
+                kind="rate_limit",
+                status=status,
+                retry_after_seconds=retry_after,
+            )
+
+        raise TransientFailure(
+            "{} returned HTTP {}.".format(operation, status),
+            status=status,
+        )
+
+    sample = await page_text_sample(page)
+    title = ""
+
+    try:
+        title = await page.title()
+    except Exception:
+        pass
+
+    combined = "{}\n{}\n{}".format(page.url, title, sample)
+
+    if text_contains_any(combined, RATE_LIMIT_TEXT_PATTERNS):
+        raise ProtectionEvent(
+            "{} displayed a rate-limit response.".format(operation),
+            kind="rate_limit",
+            status=status,
+            retry_after_seconds=retry_after,
+        )
+
+    if text_contains_any(combined, BLOCK_TEXT_PATTERNS):
+        raise ProtectionEvent(
+            "{} displayed a blocking or human-verification challenge."
+            .format(operation),
+            kind="blocked",
+            status=status,
+            retry_after_seconds=retry_after,
+        )
+
+    if not allow_login_page and LOGIN_PATH.lower() in page.url.lower():
+        raise SessionExpired(
+            "{} redirected to the BIU login page.".format(operation)
+        )
+
+
+def inspect_fetch_result(
+    result: Dict[str, Any],
+    operation: str,
+) -> None:
+    status = int(result.get("status", 0) or 0)
+    url = normalize_text(result.get("url", ""))
+    text = normalize_text(result.get("text", ""))
+    retry_after = parse_retry_after(
+        normalize_text(result.get("retry_after", ""))
+    )
+
+    combined = "{}\n{}".format(url, text)
+
+    if status in RATE_LIMIT_STATUSES:
+        raise ProtectionEvent(
+            "{} returned HTTP {}.".format(operation, status),
+            kind="rate_limit",
+            status=status,
+            retry_after_seconds=retry_after,
+        )
+
+    if status in BLOCK_STATUSES:
+        raise ProtectionEvent(
+            "{} returned HTTP {}.".format(operation, status),
+            kind="blocked",
+            status=status,
+            retry_after_seconds=retry_after,
+        )
+
+    if status in AUTH_STATUSES:
+        raise SessionExpired(
+            "{} returned HTTP {}.".format(operation, status)
+        )
+
+    if status in TRANSIENT_STATUSES:
+        if status == 503 and retry_after is not None:
+            raise ProtectionEvent(
+                "{} returned HTTP 503 with Retry-After."
+                .format(operation),
+                kind="rate_limit",
+                status=status,
+                retry_after_seconds=retry_after,
+            )
+
+        raise TransientFailure(
+            "{} returned HTTP {}.".format(operation, status),
+            status=status,
+        )
+
+    if text_contains_any(combined, RATE_LIMIT_TEXT_PATTERNS):
+        raise ProtectionEvent(
+            "{} displayed a rate-limit response.".format(operation),
+            kind="rate_limit",
+            status=status or None,
+            retry_after_seconds=retry_after,
+        )
+
+    if text_contains_any(combined, BLOCK_TEXT_PATTERNS):
+        raise ProtectionEvent(
+            "{} displayed a blocking or human-verification challenge."
+            .format(operation),
+            kind="blocked",
+            status=status or None,
+            retry_after_seconds=retry_after,
+        )
+
+    if LOGIN_PATH.lower() in url.lower():
+        raise SessionExpired(
+            "{} redirected to the BIU login page.".format(operation)
+        )
+
+    if TABLE_HINT.lower() not in text.lower():
+        raise SessionExpired(
+            "{} did not return the authenticated grades page."
+            .format(operation)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Browser helpers
+# ---------------------------------------------------------------------------
+
 def resolve_auth_method(argument: Optional[str]) -> str:
     if argument:
         return argument
@@ -500,25 +1289,38 @@ async def table_exists(page: Page) -> bool:
         return False
 
 
-async def navigate(page: Page, url: str) -> None:
-    try:
-        await page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=60_000,
-        )
+async def paced_navigate(
+    page: Page,
+    url: str,
+    gate: RequestGate,
+    protection: ProtectionController,
+    *,
+    operation: str,
+    allow_login_page: bool,
+    allow_recovery_probe: bool,
+) -> Optional[Response]:
+    await protection.prepare_activity(allow_recovery_probe)
 
-    except PlaywrightTimeoutError:
-        log("Navigation timed out. Inspecting the current page.")
+    async with gate.slot(operation):
+        try:
+            response = await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
 
-    try:
-        await page.wait_for_load_state(
-            "networkidle",
-            timeout=15_000,
-        )
+        except PlaywrightTimeoutError as exc:
+            raise TransientFailure(
+                "{} timed out.".format(operation)
+            ) from exc
 
-    except PlaywrightTimeoutError:
-        pass
+    await inspect_loaded_page(
+        page,
+        response,
+        allow_login_page=allow_login_page,
+        operation=operation,
+    )
+    return response
 
 
 async def first_visible(locator: Locator) -> Optional[Locator]:
@@ -626,16 +1428,17 @@ async def find_submit_button(page: Page) -> Optional[Locator]:
 
 
 async def find_otp_input(page: Page) -> Optional[Locator]:
-    patterns = [
-        r"קוד",
-        r"אימות",
-        r"חד.?פעמי",
-        r"verification",
-        r"otp",
-        r"code",
-    ]
-
-    candidate = await find_text_input(page, patterns)
+    candidate = await find_text_input(
+        page,
+        [
+            r"קוד",
+            r"אימות",
+            r"חד.?פעמי",
+            r"verification",
+            r"otp",
+            r"code",
+        ],
+    )
 
     if candidate is not None:
         return candidate
@@ -676,6 +1479,13 @@ async def wait_for_otp_or_grades(
     deadline = loop.time() + timeout_seconds
 
     while loop.time() < deadline:
+        await inspect_loaded_page(
+            page,
+            None,
+            allow_login_page=True,
+            operation="BIU login",
+        )
+
         if await table_exists(page):
             return
 
@@ -686,7 +1496,7 @@ async def wait_for_otp_or_grades(
 
         await asyncio.sleep(1)
 
-    raise RuntimeError(
+    raise TransientFailure(
         "The OTP field or grades page was not detected "
         "after login submission."
     )
@@ -726,11 +1536,28 @@ def get_direct_credentials() -> Tuple[str, str]:
     return student_id, phone
 
 
-async def direct_login_headless(page: Page) -> Page:
+async def direct_login_headless(
+    page: Page,
+    gate: RequestGate,
+    protection: ProtectionController,
+    auth_budget: AuthenticationBudget,
+    *,
+    initial_login: bool,
+) -> Page:
+    auth_budget.record_or_raise(initial_login=initial_login)
     student_id, phone = get_direct_credentials()
 
     log("Starting direct BIU login in headless mode.")
-    await navigate(page, DIRECT_LOGIN_URL)
+
+    await paced_navigate(
+        page,
+        DIRECT_LOGIN_URL,
+        gate,
+        protection,
+        operation="direct login page",
+        allow_login_page=True,
+        allow_recovery_probe=True,
+    )
 
     id_input = await find_text_input(
         page,
@@ -756,7 +1583,7 @@ async def direct_login_headless(page: Page) -> Page:
     )
 
     if id_input is None or phone_input is None:
-        raise RuntimeError(
+        raise TransientFailure(
             "Could not identify the ID and phone fields "
             "on the BIU login page."
         )
@@ -767,23 +1594,27 @@ async def direct_login_headless(page: Page) -> Page:
     submit = await find_submit_button(page)
 
     if submit is None:
-        raise RuntimeError(
+        raise TransientFailure(
             "Could not identify the submit button "
             "on the BIU login page."
         )
 
     log("ID and phone number were filled automatically.")
-    await submit.click()
+
+    async with gate.slot("submit direct login"):
+        await submit.click()
+
     await wait_for_otp_or_grades(page)
 
     if await table_exists(page):
+        await protection.record_success()
         log("Direct BIU authentication completed without a new OTP.")
         return page
 
     otp_input = await find_otp_input(page)
 
     if otp_input is None:
-        raise RuntimeError(
+        raise TransientFailure(
             "Could not identify the one-time verification code field."
         )
 
@@ -801,11 +1632,13 @@ async def direct_login_headless(page: Page) -> Page:
     otp_submit = await find_submit_button(page)
 
     if otp_submit is None:
-        raise RuntimeError(
+        raise TransientFailure(
             "Could not identify the OTP submit button."
         )
 
-    await otp_submit.click()
+    async with gate.slot("submit OTP"):
+        await otp_submit.click()
+
     log("The one-time verification code was submitted.")
 
     try:
@@ -814,21 +1647,39 @@ async def direct_login_headless(page: Page) -> Page:
             timeout=90_000,
         )
 
-    except PlaywrightTimeoutError as exc:
-        await navigate(page, TARGET_URL)
+    except PlaywrightTimeoutError:
+        await inspect_loaded_page(
+            page,
+            None,
+            allow_login_page=True,
+            operation="OTP submission",
+        )
 
-        if not await table_exists(page):
-            raise RuntimeError(
-                "Authentication completed, but the grades page "
-                "was not available."
-            ) from exc
+        await paced_navigate(
+            page,
+            TARGET_URL,
+            gate,
+            protection,
+            operation="open grades after OTP",
+            allow_login_page=False,
+            allow_recovery_probe=True,
+        )
 
+    if not await table_exists(page):
+        raise SessionExpired(
+            "Authentication completed, but the grades table "
+            "was not available."
+        )
+
+    await protection.record_success()
     log("Direct headless authentication completed successfully.")
     return page
 
 
 async def wait_for_manual_login(
     context: BrowserContext,
+    gate: RequestGate,
+    protection: ProtectionController,
 ) -> Page:
     log("Waiting for manual BIU authentication.")
     log("No Enter key is required.")
@@ -839,27 +1690,40 @@ async def wait_for_manual_login(
 
     while loop.time() < deadline:
         for candidate in reversed(context.pages):
+            await inspect_loaded_page(
+                candidate,
+                None,
+                allow_login_page=True,
+                operation="manual login",
+            )
+
             if await table_exists(candidate):
+                await protection.record_success()
                 log("Manual authentication was detected automatically.")
                 return candidate
 
-        if loop.time() - last_target_attempt >= 5:
+        if loop.time() - last_target_attempt >= 90:
             current = await choose_page(context)
 
             try:
-                await current.goto(
+                await paced_navigate(
+                    current,
                     TARGET_URL,
-                    wait_until="domcontentloaded",
-                    timeout=30_000,
+                    gate,
+                    protection,
+                    operation="manual login verification",
+                    allow_login_page=True,
+                    allow_recovery_probe=True,
                 )
 
                 if await table_exists(current):
+                    await protection.record_success()
                     log(
                         "Manual authentication was detected automatically."
                     )
                     return current
 
-            except Exception:
+            except SessionExpired:
                 pass
 
             last_target_attempt = loop.time()
@@ -874,11 +1738,6 @@ async def wait_for_manual_login(
 
 
 async def minimize_browser(page: Page) -> None:
-    """
-    Minimize the visible Chromium browser where supported.
-
-    Failure is non-fatal because desktop environments differ.
-    """
     try:
         cdp = await page.context.new_cdp_session(page)
         window = await cdp.send("Browser.getWindowForTarget")
@@ -900,6 +1759,10 @@ async def minimize_browser(page: Page) -> None:
             "The watcher will continue.".format(exc)
         )
 
+
+# ---------------------------------------------------------------------------
+# Grade extraction
+# ---------------------------------------------------------------------------
 
 async def load_all_rows(page: Page) -> int:
     selector = "table[id*='{}']".format(TABLE_HINT)
@@ -950,7 +1813,6 @@ async def load_all_rows(page: Page) -> int:
             last_count
         )
     )
-
     return last_count
 
 
@@ -959,9 +1821,7 @@ async def extract_grade_rows(page: Page) -> List[Dict[str, str]]:
     table = page.locator(selector).first
 
     if await table.count() == 0:
-        raise RuntimeError(
-            "The BIU grades table was not found."
-        )
+        raise SessionExpired("The BIU grades table was not found.")
 
     await load_all_rows(page)
 
@@ -1089,18 +1949,14 @@ async def extract_grade_rows(page: Page) -> List[Dict[str, str]]:
             rows.append(row)
 
     if not rows:
-        raise RuntimeError(
-            "The grades table was found, "
-            "but no rows were extracted."
+        raise TransientFailure(
+            "The grades table was found, but no rows were extracted."
         )
 
-    if not any(
-        is_grade_header(header)
-        for header in headers
-    ):
-        raise RuntimeError(
-            "The grades table was found, "
-            "but no grade column was identified."
+    if not any(is_grade_header(header) for header in headers):
+        raise TransientFailure(
+            "The grades table was found, but no grade column "
+            "was identified."
         )
 
     return rows
@@ -1108,83 +1964,180 @@ async def extract_grade_rows(page: Page) -> List[Dict[str, str]]:
 
 async def perform_check(
     page: Page,
+    gate: RequestGate,
+    protection: ProtectionController,
 ) -> Tuple[List[Dict[str, str]], List[str], bool]:
-    try:
-        await page.reload(
-            wait_until="domcontentloaded",
-            timeout=60_000,
-        )
+    await protection.prepare_activity(allow_recovery_probe=True)
 
-    except PlaywrightTimeoutError:
-        log(
-            "Page reload timed out. "
-            "Inspecting the current page."
-        )
+    async with gate.slot("grade check"):
+        try:
+            response = await page.reload(
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
 
-    if not await table_exists(page):
-        raise RuntimeError(
-            "The BIU session expired or "
-            "the grades table is unavailable."
-        )
+        except PlaywrightTimeoutError as exc:
+            raise TransientFailure(
+                "The grades page reload timed out."
+            ) from exc
+
+    await inspect_loaded_page(
+        page,
+        response,
+        allow_login_page=False,
+        operation="grade check",
+    )
 
     rows = await extract_grade_rows(page)
     previous = read_snapshot()
 
     if previous is None:
         write_snapshot(rows)
+        await protection.record_success()
         return rows, [], True
 
     changes = compare_snapshots(previous, rows)
     write_snapshot(rows)
+    await protection.record_success()
 
     return rows, changes, False
 
 
+# ---------------------------------------------------------------------------
+# Keepalive
+# ---------------------------------------------------------------------------
+
+async def browser_keepalive(
+    page: Page,
+    gate: RequestGate,
+    protection: ProtectionController,
+) -> None:
+    """
+    Use fetch() inside the authenticated browser page.
+
+    This keeps the request within the same browser context and avoids creating
+    a separate API client identity.
+    """
+    await protection.prepare_activity(allow_recovery_probe=False)
+
+    async with gate.slot("session keepalive"):
+        result = await page.evaluate(
+            """
+            async url => {
+                try {
+                    const response = await fetch(url, {
+                        method: "GET",
+                        credentials: "include",
+                        cache: "no-store",
+                        redirect: "follow",
+                        headers: {
+                            "Accept": "text/html,application/xhtml+xml"
+                        }
+                    });
+
+                    const text = await response.text();
+
+                    return {
+                        status: response.status,
+                        url: response.url,
+                        retry_after:
+                            response.headers.get("retry-after") || "",
+                        text: text.slice(0, 12000)
+                    };
+                } catch (error) {
+                    return {
+                        status: 0,
+                        url: "",
+                        retry_after: "",
+                        text: "",
+                        error: String(error)
+                    };
+                }
+            }
+            """,
+            TARGET_URL,
+        )
+
+    if result.get("error"):
+        raise TransientFailure(
+            "Browser keepalive failed: {}".format(result["error"])
+        )
+
+    inspect_fetch_result(result, "session keepalive")
+
+
 async def keepalive_loop(
-    context: BrowserContext,
+    page: Page,
+    gate: RequestGate,
+    protection: ProtectionController,
     stop_event: asyncio.Event,
     interval_minutes: int,
 ) -> None:
-    interval_seconds = interval_minutes * 60
+    base_seconds = interval_minutes * 60
 
     while not stop_event.is_set():
-        try:
-            await asyncio.wait_for(
-                stop_event.wait(),
-                timeout=interval_seconds,
-            )
+        wait_seconds = jittered_seconds(
+            base_seconds,
+            KEEPALIVE_JITTER_RATIO,
+        )
+
+        if await sleep_or_stop(stop_event, wait_seconds):
             break
 
-        except asyncio.TimeoutError:
-            pass
-
         try:
-            response = await context.request.get(
-                TARGET_URL,
-                timeout=45_000,
-                fail_on_status_code=False,
+            await browser_keepalive(page, gate, protection)
+            log("BIU session keepalive completed successfully.")
+
+        except CircuitOpen:
+            # Keepalive never consumes the single HALF_OPEN recovery probe.
+            continue
+
+        except SessionExpired:
+            # The main grade loop owns reauthentication.
+            log("Keepalive detected an expired BIU session.")
+            continue
+
+        except ProtectionEvent as event:
+            cooldown = await protection.record_protection_event(event)
+
+            if await protection.should_notify():
+                await notify_async(
+                    "BIU Grade Watcher paused",
+                    (
+                        "BIU returned a blocking or rate-limit response.\n"
+                        "The watcher paused automatically for approximately "
+                        "{} minute(s).\n\n"
+                        "It will not attempt to bypass the restriction."
+                    ).format(max(1, cooldown // 60)),
+                )
+
+        except TransientFailure as exc:
+            cooldown = await protection.record_transient_failure(
+                str(exc),
+                exc.status,
             )
 
-            if response.ok:
+            if cooldown:
                 log(
-                    "BIU session keepalive completed successfully."
-                )
-            else:
-                log(
-                    "BIU session keepalive returned HTTP {}.".format(
-                        response.status
-                    )
+                    "Keepalive transient failures opened the circuit."
                 )
 
         except Exception as exc:
-            log(
-                "BIU session keepalive failed: {}".format(exc)
+            cooldown = await protection.record_transient_failure(
+                "Unexpected keepalive failure: {}".format(exc)
             )
 
+            if cooldown:
+                log(
+                    "Unexpected keepalive failures opened the circuit."
+                )
 
-def make_notification_message(
-    changes: List[str],
-) -> str:
+
+# ---------------------------------------------------------------------------
+# Main watcher
+# ---------------------------------------------------------------------------
+
+def make_notification_message(changes: List[str]) -> str:
     message = "\n\n".join(changes[:6])
 
     if len(changes) > 6:
@@ -1193,31 +2146,108 @@ def make_notification_message(
         )
 
     if len(message) > 3500:
-        message = (
-            message[:3500]
-            + "\n\n[Message truncated]"
-        )
+        message = message[:3500] + "\n\n[Message truncated]"
 
     return message
 
 
-async def run(args: argparse.Namespace) -> int:
-    dotenv_path = Path(
-        args.env_file
-    ).expanduser().resolve()
+async def authenticate(
+    auth_method: str,
+    context: BrowserContext,
+    page: Page,
+    gate: RequestGate,
+    protection: ProtectionController,
+    auth_budget: AuthenticationBudget,
+    *,
+    initial_login: bool,
+) -> Page:
+    if auth_method == "direct":
+        return await direct_login_headless(
+            page,
+            gate,
+            protection,
+            auth_budget,
+            initial_login=initial_login,
+        )
 
+    auth_budget.record_or_raise(initial_login=initial_login)
+
+    await paced_navigate(
+        page,
+        MY_BIU_URL,
+        gate,
+        protection,
+        operation="open My Bar-Ilan",
+        allow_login_page=True,
+        allow_recovery_probe=True,
+    )
+
+    page = await wait_for_manual_login(
+        context,
+        gate,
+        protection,
+    )
+    await minimize_browser(page)
+    return page
+
+
+async def handle_protection_event(
+    protection: ProtectionController,
+    event: ProtectionEvent,
+) -> int:
+    cooldown = await protection.record_protection_event(event)
+
+    if await protection.should_notify():
+        await notify_async(
+            "BIU Grade Watcher paused",
+            (
+                "BIU returned a blocking or rate-limit response.\n"
+                "The watcher paused automatically for approximately "
+                "{} minute(s).\n\n"
+                "Reason: {}\n"
+                "No bypass attempt will be made."
+            ).format(max(1, cooldown // 60), event),
+        )
+
+    return cooldown
+
+
+async def wait_for_circuit_recovery(
+    protection: ProtectionController,
+    stop_event: asyncio.Event,
+) -> bool:
+    remaining = protection.seconds_until_probe()
+
+    if remaining <= 0:
+        return False
+
+    log(
+        "Protection circuit is OPEN. Next controlled probe in "
+        "approximately {} minute(s).".format(max(1, remaining // 60))
+    )
+
+    return await sleep_or_stop(
+        stop_event,
+        min(remaining, 15 * 60),
+    )
+
+
+async def run(args: argparse.Namespace) -> int:
+    dotenv_path = Path(args.env_file).expanduser().resolve()
     load_dotenv_file(dotenv_path)
 
-    auth_method = resolve_auth_method(
-        args.auth_method
-    )
-
-    PROFILE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    auth_method = resolve_auth_method(args.auth_method)
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
     headless = auth_method == "direct"
+
+    protection = ProtectionController(PROTECTION_FILE)
+    gate = RequestGate(
+        minimum_gap_seconds=args.request_min_gap,
+        maximum_requests_per_hour=args.max_requests_per_hour,
+    )
+    auth_budget = AuthenticationBudget()
+    stop_event = asyncio.Event()
 
     async with async_playwright() as playwright:
         log("Starting the BIU browser session.")
@@ -1228,66 +2258,103 @@ async def run(args: argparse.Namespace) -> int:
                 "headless" if headless else "visible"
             )
         )
+        log(
+            "Safety pacing: minimum {} seconds between top-level "
+            "operations, maximum {} per hour.".format(
+                args.request_min_gap,
+                args.max_requests_per_hour,
+            )
+        )
 
+        # No stealth/fingerprint-spoofing flags are used.
         context = await playwright.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
             headless=headless,
             viewport={"width": 1440, "height": 1000},
             locale="he-IL",
             timezone_id="Asia/Jerusalem",
-            args=[
-                "--disable-blink-features=AutomationControlled"
-            ],
         )
 
-        stop_event = asyncio.Event()
         keepalive_task: Optional[asyncio.Task] = None
 
         try:
             page = await choose_page(context)
-            await navigate(page, TARGET_URL)
 
-            if (
-                not args.force_login
-                and await table_exists(page)
-            ):
-                log("The existing BIU session is valid.")
-
-            elif auth_method == "direct":
-                page = await direct_login_headless(page)
-
-            else:
-                log(
-                    'Opening the "My Bar-Ilan" portal.'
+            try:
+                await paced_navigate(
+                    page,
+                    TARGET_URL,
+                    gate,
+                    protection,
+                    operation="initial grades page",
+                    allow_login_page=True,
+                    allow_recovery_probe=True,
                 )
 
-                await navigate(page, MY_BIU_URL)
-                page = await wait_for_manual_login(context)
-                await minimize_browser(page)
+                if (
+                    not args.force_login
+                    and await table_exists(page)
+                ):
+                    await protection.record_success()
+                    log("The existing BIU session is valid.")
+
+                else:
+                    page = await authenticate(
+                        auth_method,
+                        context,
+                        page,
+                        gate,
+                        protection,
+                        auth_budget,
+                        initial_login=True,
+                    )
+
+            except SessionExpired:
+                page = await authenticate(
+                    auth_method,
+                    context,
+                    page,
+                    gate,
+                    protection,
+                    auth_budget,
+                    initial_login=True,
+                )
 
             keepalive_task = asyncio.create_task(
                 keepalive_loop(
-                    context,
+                    page,
+                    gate,
+                    protection,
                     stop_event,
                     args.keepalive,
                 )
             )
 
-            while True:
-                log(
-                    "Checking BIU In-Bar "
-                    "for new grades now."
-                )
+            while not stop_event.is_set():
+                if protection.state.circuit_state == "OPEN":
+                    stopped = await wait_for_circuit_recovery(
+                        protection,
+                        stop_event,
+                    )
+
+                    if stopped:
+                        break
+
+                    continue
+
+                log("Checking BIU In-Bar for new grades now.")
 
                 try:
-                    rows, changes, initialized = (
-                        await perform_check(page)
+                    rows, changes, initialized = await perform_check(
+                        page,
+                        gate,
+                        protection,
                     )
 
                     if initialized:
                         log(
-                            "Initial snapshot saved successfully: "
-                            "{} rows. No notification was generated."
+                            "Initial snapshot saved successfully: {} rows. "
+                            "No notification was generated."
                             .format(len(rows))
                         )
 
@@ -1297,15 +2364,14 @@ async def run(args: argparse.Namespace) -> int:
                             .format(len(changes))
                         )
 
-                        desktop_notification(
+                        await notify_async(
                             "BIU In-Bar grade update",
                             make_notification_message(changes),
                         )
 
                     else:
                         log(
-                            "Check completed: {} rows, "
-                            "no new grades."
+                            "Check completed: {} rows, no new grades."
                             .format(len(rows))
                         )
 
@@ -1318,44 +2384,114 @@ async def run(args: argparse.Namespace) -> int:
                             )
                         )
 
-                except Exception as exc:
-                    log(
-                        "The current BIU session failed: {}"
-                        .format(exc)
+                except SessionExpired as exc:
+                    log("The BIU session expired: {}".format(exc))
+
+                    try:
+                        page = await authenticate(
+                            auth_method,
+                            context,
+                            page,
+                            gate,
+                            protection,
+                            auth_budget,
+                            initial_login=False,
+                        )
+
+                    except ProtectionEvent as event:
+                        await handle_protection_event(
+                            protection,
+                            event,
+                        )
+
+                    except Exception as auth_exc:
+                        cooldown = await protection.record_transient_failure(
+                            "Authentication failed: {}".format(auth_exc)
+                        )
+
+                        log(
+                            "Authentication failed without automatic retry: {}"
+                            .format(auth_exc)
+                        )
+
+                        if cooldown == 0:
+                            # Prevent an immediate tight retry even before the
+                            # transient threshold opens the circuit.
+                            await sleep_or_stop(stop_event, 5 * 60)
+
+                    continue
+
+                except ProtectionEvent as event:
+                    await handle_protection_event(
+                        protection,
+                        event,
+                    )
+                    continue
+
+                except CircuitOpen:
+                    continue
+
+                except TransientFailure as exc:
+                    cooldown = await protection.record_transient_failure(
+                        str(exc),
+                        exc.status,
                     )
 
-                    if auth_method == "direct":
-                        log(
-                            "Re-authenticating in "
-                            "headless direct-login mode."
+                    log("Transient BIU failure: {}".format(exc))
+
+                    if cooldown == 0:
+                        delay = int(
+                            jittered_seconds(
+                                TRANSIENT_BACKOFF_BASE_SECONDS
+                                * max(
+                                    1,
+                                    protection.state.consecutive_failures,
+                                ),
+                                0.20,
+                            )
                         )
 
-                        page = await direct_login_headless(page)
-
-                    else:
                         log(
-                            "Manual authentication "
-                            "is required again."
+                            "Waiting {} second(s) before continuing."
+                            .format(delay)
                         )
+                        await sleep_or_stop(stop_event, delay)
 
-                        await navigate(page, MY_BIU_URL)
-                        page = await wait_for_manual_login(context)
-                        await minimize_browser(page)
+                    continue
+
+                except Exception as exc:
+                    cooldown = await protection.record_transient_failure(
+                        "Unexpected check failure: {}".format(exc)
+                    )
+
+                    log(
+                        "Unexpected check failure: {}\n{}"
+                        .format(exc, traceback.format_exc())
+                    )
+
+                    if cooldown == 0:
+                        await sleep_or_stop(stop_event, 5 * 60)
 
                     continue
 
                 if args.once:
                     return 0
 
-                log(
-                    "Waiting {} minute(s) "
-                    "before the next grade check."
-                    .format(args.interval)
+                wait_seconds = jittered_seconds(
+                    args.interval * 60,
+                    GRADE_JITTER_RATIO,
                 )
 
-                await asyncio.sleep(
-                    args.interval * 60
+                log(
+                    "Waiting approximately {:.1f} minute(s) "
+                    "before the next grade check."
+                    .format(wait_seconds / 60)
                 )
+
+                if await sleep_or_stop(stop_event, wait_seconds):
+                    break
+
+            return 0
 
         finally:
             stop_event.set()
@@ -1365,18 +2501,21 @@ async def run(args: argparse.Namespace) -> int:
 
                 try:
                     await keepalive_task
-
                 except asyncio.CancelledError:
                     pass
 
             await context.close()
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Monitor BIU In-Bar "
-            "for new or changed grades."
+            "Monitor BIU In-Bar for new or changed grades "
+            "with conservative pacing and automatic block protection."
         )
     )
 
@@ -1391,9 +2530,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_INTERVAL_MINUTES,
         help=(
-            "Grade-check interval in minutes. "
-            "Default: {}."
-            .format(DEFAULT_INTERVAL_MINUTES)
+            "Grade-check interval in minutes. Minimum: {}. Default: {}."
+            .format(
+                MIN_GRADE_INTERVAL_MINUTES,
+                DEFAULT_INTERVAL_MINUTES,
+            )
         ),
     )
 
@@ -1402,9 +2543,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_KEEPALIVE_MINUTES,
         help=(
-            "BIU session keepalive interval in minutes. "
+            "Session keepalive interval in minutes. Minimum: {}. "
             "Default: {}."
-            .format(DEFAULT_KEEPALIVE_MINUTES)
+            .format(
+                MIN_KEEPALIVE_INTERVAL_MINUTES,
+                DEFAULT_KEEPALIVE_MINUTES,
+            )
         ),
     )
 
@@ -1420,46 +2564,75 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-login",
         action="store_true",
-        help=(
-            "Force the selected authentication flow."
-        ),
+        help="Force the selected authentication flow.",
     )
 
     parser.add_argument(
         "--env-file",
         default=".env",
-        help=(
-            "Path to the optional .env file. "
-            "Default: .env"
-        ),
+        help="Path to the optional .env file. Default: .env",
     )
 
     parser.add_argument(
         "--reset",
         action="store_true",
+        help="Reset the saved grade snapshot and exit.",
+    )
+
+    parser.add_argument(
+        "--clear-protection-state",
+        action="store_true",
         help=(
-            "Reset the saved grade snapshot and exit."
+            "Clear the persistent circuit-breaker state and exit. "
+            "Use only after confirming BIU is accessible normally."
         ),
+    )
+
+    parser.add_argument(
+        "--protection-status",
+        action="store_true",
+        help="Print the persistent protection state and exit.",
     )
 
     parser.add_argument(
         "--print-rows",
         action="store_true",
+        help="Print all extracted grade rows as JSON.",
+    )
+
+    parser.add_argument(
+        "--request-min-gap",
+        type=int,
+        default=DEFAULT_REQUEST_MIN_GAP_SECONDS,
         help=(
-            "Print all extracted grade rows as JSON."
+            "Minimum seconds between top-level BIU operations. "
+            "Default: {}."
+            .format(DEFAULT_REQUEST_MIN_GAP_SECONDS)
+        ),
+    )
+
+    parser.add_argument(
+        "--max-requests-per-hour",
+        type=int,
+        default=DEFAULT_MAX_TOP_LEVEL_REQUESTS_PER_HOUR,
+        help=(
+            "Maximum top-level BIU operations per hour. Default: {}."
+            .format(DEFAULT_MAX_TOP_LEVEL_REQUESTS_PER_HOUR)
         ),
     )
 
     args = parser.parse_args()
 
-    if args.interval < 1:
+    if args.interval < MIN_GRADE_INTERVAL_MINUTES:
         parser.error(
-            "--interval must be at least 1 minute"
+            "--interval must be at least {} minutes"
+            .format(MIN_GRADE_INTERVAL_MINUTES)
         )
 
-    if args.keepalive < 1:
+    if args.keepalive < MIN_KEEPALIVE_INTERVAL_MINUTES:
         parser.error(
-            "--keepalive must be at least 1 minute"
+            "--keepalive must be at least {} minutes"
+            .format(MIN_KEEPALIVE_INTERVAL_MINUTES)
         )
 
     if (
@@ -1467,8 +2640,23 @@ def parse_args() -> argparse.Namespace:
         and not args.once
     ):
         parser.error(
-            "--keepalive should be shorter than "
-            "--interval for continuous monitoring"
+            "--keepalive must be shorter than --interval "
+            "for continuous monitoring"
+        )
+
+    if args.request_min_gap < 5:
+        parser.error(
+            "--request-min-gap must be at least 5 seconds"
+        )
+
+    if args.max_requests_per_hour < 10:
+        parser.error(
+            "--max-requests-per-hour must be at least 10"
+        )
+
+    if args.max_requests_per_hour > 60:
+        parser.error(
+            "--max-requests-per-hour cannot exceed 60"
         )
 
     return args
@@ -1488,20 +2676,53 @@ def main() -> int:
         reset_snapshot()
         return 0
 
+    if args.clear_protection_state:
+        protection = ProtectionController(PROTECTION_FILE)
+        protection.clear()
+        log("The persistent protection state was cleared.")
+        return 0
+
+    if args.protection_status:
+        protection = ProtectionController(PROTECTION_FILE)
+        print(
+            json.dumps(
+                protection.status_dict(),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
     try:
-        return asyncio.run(run(args))
+        with InstanceLock(LOCK_FILE):
+            return asyncio.run(run(args))
 
     except KeyboardInterrupt:
         log("Stopped by user.")
         return 130
 
+    except ProtectionEvent as event:
+        async def persist_event() -> int:
+            controller = ProtectionController(PROTECTION_FILE)
+            return await controller.record_protection_event(event)
+
+        cooldown = asyncio.run(persist_event())
+
+        log(
+            "The watcher stopped safely after a protection event. "
+            "Cooldown: approximately {} minute(s)."
+            .format(max(1, cooldown // 60))
+        )
+        return 2
+
+    except CircuitOpen as exc:
+        log(str(exc))
+        return 2
+
     except Exception as exc:
         log(
             "Fatal error: {}\n{}"
-            .format(
-                exc,
-                traceback.format_exc(),
-            )
+            .format(exc, traceback.format_exc())
         )
 
         try:
@@ -1509,7 +2730,6 @@ def main() -> int:
                 "BIU Grade Watcher error",
                 "The watcher stopped:\n{}".format(exc),
             )
-
         except Exception:
             pass
 
