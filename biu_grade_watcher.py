@@ -2,31 +2,40 @@
 # -*- coding: utf-8 -*-
 
 """
-BIU In-Bar Grade Watcher v7
-Windows / Python 3.8
+BIU In-Bar Grade Watcher v8
+Cross-platform: Windows and Linux
+Python 3.8+
 
 Authentication modes
 --------------------
 1. direct
-   - Runs fully headless from start to finish.
+   - Fully headless.
    - Reads ID and phone from environment variables or .env.
    - Fills the direct In-Bar login form automatically.
-   - Prompts for the one-time verification code in PowerShell.
+   - Prompts for the one-time verification code in the terminal.
    - Submits the OTP inside the same headless browser context.
 
 2. my-biu
-   - Opens the "My Bar-Ilan" portal in a visible browser.
+   - Opens the "My Bar-Ilan" portal in a visible Chromium browser.
    - The user completes authentication manually.
-   - The same browser is minimized after authentication.
+   - The watcher detects successful authentication automatically.
 
 Session TTL
 -----------
 BIU sessions may expire quickly when idle. A lightweight authenticated
 keepalive request runs independently from the grade-check interval.
 
-Example:
-- grade check every 10 minutes
-- keepalive every 2 minutes
+Platform support
+----------------
+Windows:
+- Native MessageBox notifications.
+- Data stored under %LOCALAPPDATA%\\BIUGradeWatcher.
+
+Linux:
+- Desktop notifications through notify-send when available.
+- Falls back to terminal output if notify-send is unavailable.
+- Data stored under $XDG_DATA_HOME/biu-grade-watcher or
+  ~/.local/share/biu-grade-watcher.
 """
 
 from __future__ import annotations
@@ -37,9 +46,12 @@ import ctypes
 import hashlib
 import json
 import os
+import platform
 import re
+import shutil
+import subprocess
+import tempfile
 import traceback
-import winreg
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,23 +64,24 @@ from playwright.async_api import (
     async_playwright,
 )
 
+
 TARGET_URL = (
     "https://inbar.biu.ac.il/Live/"
     "StudentAssignmentTermList.aspx?edpr=3"
 )
+
 DIRECT_LOGIN_URL = (
     "https://inbar.biu.ac.il/Live/Login.aspx"
     "?ReturnUrl=/Live/StudentAssignmentTermList.aspx?edpr=3"
 )
+
 MY_BIU_URL = "https://my.biu.ac.il/"
 
 TARGET_PATH = "StudentAssignmentTermList.aspx"
 TABLE_HINT = "gvStudentAssignmentTermList"
 
-APP_NAME = "BIUGradeWatcher"
-REGISTRY_PATH = r"Software\BIUGradeWatcher"
-REGISTRY_SNAPSHOT_VALUE = "GradeSnapshotV1"
-REGISTRY_LAST_CHECK_VALUE = "LastSuccessfulCheck"
+APP_NAME_WINDOWS = "BIUGradeWatcher"
+APP_NAME_LINUX = "biu-grade-watcher"
 
 DEFAULT_INTERVAL_MINUTES = 10
 DEFAULT_KEEPALIVE_MINUTES = 2
@@ -84,18 +97,50 @@ TERM_HEADER_NAMES = {"מועד", "תקופה"}
 NOTEBOOK_HEADER_NAMES = {"מספר מחברת", "מחברת"}
 
 
-def app_data_dir() -> Path:
-    base = os.environ.get("LOCALAPPDATA")
-    if not base:
-        base = str(Path.home() / "AppData" / "Local")
+def current_platform() -> str:
+    system = platform.system().lower()
 
-    path = Path(base) / APP_NAME
+    if system == "windows":
+        return "windows"
+
+    if system == "linux":
+        return "linux"
+
+    return "unsupported"
+
+
+PLATFORM = current_platform()
+
+
+def application_directory() -> Path:
+    if PLATFORM == "windows":
+        base = os.environ.get("LOCALAPPDATA")
+
+        if not base:
+            base = str(Path.home() / "AppData" / "Local")
+
+        path = Path(base) / APP_NAME_WINDOWS
+
+    elif PLATFORM == "linux":
+        xdg_data_home = os.environ.get("XDG_DATA_HOME")
+
+        if xdg_data_home:
+            path = Path(xdg_data_home) / APP_NAME_LINUX
+        else:
+            path = Path.home() / ".local" / "share" / APP_NAME_LINUX
+
+    else:
+        raise RuntimeError(
+            "Unsupported operating system: {}".format(platform.system())
+        )
+
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-APP_DIR = app_data_dir()
+APP_DIR = application_directory()
 PROFILE_DIR = APP_DIR / "browser_profile"
+SNAPSHOT_FILE = APP_DIR / "grade_snapshot.json"
 LOG_FILE = APP_DIR / "watcher.log"
 
 
@@ -115,25 +160,33 @@ def load_dotenv_file(path: Path) -> None:
     if not path.exists():
         return
 
-    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
-        line = raw_line.strip()
+    try:
+        for raw_line in path.read_text(
+            encoding="utf-8-sig"
+        ).splitlines():
+            line = raw_line.strip()
 
-        if not line or line.startswith("#") or "=" not in line:
-            continue
+            if not line or line.startswith("#") or "=" not in line:
+                continue
 
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
 
-        if (
-            len(value) >= 2
-            and value[0] == value[-1]
-            and value[0] in {"'", '"'}
-        ):
-            value = value[1:-1]
+            if (
+                len(value) >= 2
+                and value[0] == value[-1]
+                and value[0] in {"'", '"'}
+            ):
+                value = value[1:-1]
 
-        if key and key not in os.environ:
-            os.environ[key] = value
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not read environment file '{}': {}".format(path, exc)
+        )
 
 
 def normalize_text(value: Any) -> str:
@@ -163,36 +216,72 @@ def has_meaningful_grade(row: Dict[str, str]) -> bool:
 def get_first_value(row: Dict[str, str], names: set) -> str:
     for name in names:
         value = normalize_text(row.get(name, ""))
+
         if value:
             return value
+
     return ""
 
 
-def windows_popup(title: str, message: str) -> None:
-    MB_OK = 0x00000000
-    MB_ICONINFORMATION = 0x00000040
-    MB_SETFOREGROUND = 0x00010000
-    MB_TOPMOST = 0x00040000
+def desktop_notification(title: str, message: str) -> None:
+    """
+    Show a desktop notification using the current operating system.
 
-    ctypes.windll.user32.MessageBoxW(
-        None,
-        message,
-        title,
-        MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
-    )
+    Windows:
+        Native MessageBox.
 
+    Linux:
+        notify-send if available.
 
-def registry_read_snapshot() -> Optional[List[Dict[str, str]]]:
+    Fallback:
+        Console output.
+    """
     try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            REGISTRY_PATH,
-            0,
-            winreg.KEY_READ,
-        ) as key:
-            raw, _ = winreg.QueryValueEx(key, REGISTRY_SNAPSHOT_VALUE)
+        if PLATFORM == "windows":
+            MB_OK = 0x00000000
+            MB_ICONINFORMATION = 0x00000040
+            MB_SETFOREGROUND = 0x00010000
+            MB_TOPMOST = 0x00040000
 
-        data = json.loads(raw)
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                message,
+                title,
+                (
+                    MB_OK
+                    | MB_ICONINFORMATION
+                    | MB_SETFOREGROUND
+                    | MB_TOPMOST
+                ),
+            )
+            return
+
+        if PLATFORM == "linux":
+            notify_send = shutil.which("notify-send")
+
+            if notify_send:
+                subprocess.run(
+                    [notify_send, title, message],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+
+    except Exception as exc:
+        log("Desktop notification failed: {}".format(exc))
+
+    log("NOTIFICATION: {} - {}".format(title, message))
+
+
+def read_snapshot() -> Optional[List[Dict[str, str]]]:
+    if not SNAPSHOT_FILE.exists():
+        return None
+
+    try:
+        data = json.loads(
+            SNAPSHOT_FILE.read_text(encoding="utf-8")
+        )
 
         if not isinstance(data, list):
             return None
@@ -206,64 +295,35 @@ def registry_read_snapshot() -> Optional[List[Dict[str, str]]]:
             if isinstance(item, dict)
         ]
 
-    except FileNotFoundError:
-        return None
-
     except Exception as exc:
         log("Could not read the saved snapshot: {}".format(exc))
         return None
 
 
-def registry_write_snapshot(rows: List[Dict[str, str]]) -> None:
-    raw = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+def write_snapshot(rows: List[Dict[str, str]]) -> None:
+    """
+    Write the snapshot atomically.
 
-    with winreg.CreateKeyEx(
-        winreg.HKEY_CURRENT_USER,
-        REGISTRY_PATH,
-        0,
-        winreg.KEY_WRITE,
-    ) as key:
-        winreg.SetValueEx(
-            key,
-            REGISTRY_SNAPSHOT_VALUE,
-            0,
-            winreg.REG_SZ,
-            raw,
-        )
-        winreg.SetValueEx(
-            key,
-            REGISTRY_LAST_CHECK_VALUE,
-            0,
-            winreg.REG_SZ,
-            datetime.now().isoformat(timespec="seconds"),
-        )
+    A temporary file is written first and then replaced to avoid corrupting
+    the state if the process is interrupted during a write.
+    """
+    payload = json.dumps(
+        rows,
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    temp_path = SNAPSHOT_FILE.with_suffix(".tmp")
+    temp_path.write_text(payload, encoding="utf-8")
+    temp_path.replace(SNAPSHOT_FILE)
 
 
-def registry_reset() -> None:
-    try:
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, REGISTRY_PATH)
+def reset_snapshot() -> None:
+    if SNAPSHOT_FILE.exists():
+        SNAPSHOT_FILE.unlink()
         log("The saved grade snapshot was reset.")
-
-    except FileNotFoundError:
+    else:
         log("No saved grade snapshot existed.")
-
-    except OSError:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            REGISTRY_PATH,
-            0,
-            winreg.KEY_SET_VALUE,
-        ) as key:
-            for value_name in (
-                REGISTRY_SNAPSHOT_VALUE,
-                REGISTRY_LAST_CHECK_VALUE,
-            ):
-                try:
-                    winreg.DeleteValue(key, value_name)
-                except FileNotFoundError:
-                    pass
-
-        log("The saved grade snapshot was reset.")
 
 
 def row_identity(row: Dict[str, str]) -> str:
@@ -309,8 +369,10 @@ def describe_row(row: Dict[str, str]) -> str:
 
     if code:
         parts.append("Code {}".format(code))
+
     if date:
         parts.append(date)
+
     if term:
         parts.append(term)
 
@@ -321,7 +383,11 @@ def compare_snapshots(
     previous: List[Dict[str, str]],
     current: List[Dict[str, str]],
 ) -> List[str]:
-    previous_by_id = {row_identity(row): row for row in previous}
+    previous_by_id = {
+        row_identity(row): row
+        for row in previous
+    }
+
     changes: List[str] = []
 
     for row in current:
@@ -356,14 +422,25 @@ def compare_snapshots(
                 continue
 
             if not before and after:
-                differences.append("{} added: {}".format(header, after))
+                differences.append(
+                    "{} added: {}".format(header, after)
+                )
+
             elif before and after:
                 differences.append(
-                    "{} changed from {} to {}".format(header, before, after)
+                    "{} changed from {} to {}".format(
+                        header,
+                        before,
+                        after,
+                    )
                 )
+
             else:
                 differences.append(
-                    "{} removed; previous value was {}".format(header, before)
+                    "{} removed; previous value was {}".format(
+                        header,
+                        before,
+                    )
                 )
 
         if differences:
@@ -418,6 +495,7 @@ async def table_exists(page: Page) -> bool:
             ).count()
             > 0
         )
+
     except Exception:
         return False
 
@@ -434,7 +512,11 @@ async def navigate(page: Page, url: str) -> None:
         log("Navigation timed out. Inspecting the current page.")
 
     try:
-        await page.wait_for_load_state("networkidle", timeout=15_000)
+        await page.wait_for_load_state(
+            "networkidle",
+            timeout=15_000,
+        )
+
     except PlaywrightTimeoutError:
         pass
 
@@ -444,8 +526,12 @@ async def first_visible(locator: Locator) -> Optional[Locator]:
         candidate = locator.nth(index)
 
         try:
-            if await candidate.is_visible() and await candidate.is_enabled():
+            if (
+                await candidate.is_visible()
+                and await candidate.is_enabled()
+            ):
                 return candidate
+
         except Exception:
             continue
 
@@ -485,12 +571,19 @@ async def find_text_input(
         candidate = candidates.nth(index)
 
         try:
-            if await candidate.is_visible() and await candidate.is_enabled():
+            if (
+                await candidate.is_visible()
+                and await candidate.is_enabled()
+            ):
                 visible.append(candidate)
+
         except Exception:
             pass
 
-    if fallback_index is not None and 0 <= fallback_index < len(visible):
+    if (
+        fallback_index is not None
+        and 0 <= fallback_index < len(visible)
+    ):
         return visible[fallback_index]
 
     return None
@@ -548,8 +641,10 @@ async def find_otp_input(page: Page) -> Optional[Locator]:
         return candidate
 
     inputs = page.locator(
-        "input[type='text'], input[type='tel'], "
-        "input[type='number'], input[type='password']"
+        "input[type='text'], "
+        "input[type='tel'], "
+        "input[type='number'], "
+        "input[type='password']"
     )
 
     visible: List[Locator] = []
@@ -558,8 +653,12 @@ async def find_otp_input(page: Page) -> Optional[Locator]:
         item = inputs.nth(index)
 
         try:
-            if await item.is_visible() and await item.is_enabled():
+            if (
+                await item.is_visible()
+                and await item.is_enabled()
+            ):
                 visible.append(item)
+
         except Exception:
             pass
 
@@ -569,7 +668,10 @@ async def find_otp_input(page: Page) -> Optional[Locator]:
     return None
 
 
-async def wait_for_otp_or_grades(page: Page, timeout_seconds: int = 90) -> None:
+async def wait_for_otp_or_grades(
+    page: Page,
+    timeout_seconds: int = 90,
+) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
 
@@ -585,7 +687,8 @@ async def wait_for_otp_or_grades(page: Page, timeout_seconds: int = 90) -> None:
         await asyncio.sleep(1)
 
     raise RuntimeError(
-        "The OTP field or grades page was not detected after login submission."
+        "The OTP field or grades page was not detected "
+        "after login submission."
     )
 
 
@@ -654,7 +757,8 @@ async def direct_login_headless(page: Page) -> Page:
 
     if id_input is None or phone_input is None:
         raise RuntimeError(
-            "Could not identify the ID and phone fields on the BIU login page."
+            "Could not identify the ID and phone fields "
+            "on the BIU login page."
         )
 
     await id_input.fill(student_id)
@@ -664,7 +768,8 @@ async def direct_login_headless(page: Page) -> Page:
 
     if submit is None:
         raise RuntimeError(
-            "Could not identify the submit button on the BIU login page."
+            "Could not identify the submit button "
+            "on the BIU login page."
         )
 
     log("ID and phone number were filled automatically.")
@@ -683,11 +788,13 @@ async def direct_login_headless(page: Page) -> Page:
         )
 
     otp = input(
-    "Enter the one-time verification code sent by BIU: "
+        "Enter the one-time verification code sent by BIU: "
     ).strip()
 
     if not otp:
-        raise RuntimeError("No one-time verification code was entered.")
+        raise RuntimeError(
+            "No one-time verification code was entered."
+        )
 
     await otp_input.fill(otp)
 
@@ -706,20 +813,23 @@ async def direct_login_headless(page: Page) -> Page:
             "table[id*='{}']".format(TABLE_HINT),
             timeout=90_000,
         )
+
     except PlaywrightTimeoutError as exc:
-        # Try the target URL in the same authenticated headless context.
         await navigate(page, TARGET_URL)
 
         if not await table_exists(page):
             raise RuntimeError(
-                "Authentication completed, but the grades page was not available."
+                "Authentication completed, but the grades page "
+                "was not available."
             ) from exc
 
     log("Direct headless authentication completed successfully.")
     return page
 
 
-async def wait_for_manual_login(context: BrowserContext) -> Page:
+async def wait_for_manual_login(
+    context: BrowserContext,
+) -> Page:
     log("Waiting for manual BIU authentication.")
     log("No Enter key is required.")
 
@@ -744,7 +854,9 @@ async def wait_for_manual_login(context: BrowserContext) -> Page:
                 )
 
                 if await table_exists(current):
-                    log("Manual authentication was detected automatically.")
+                    log(
+                        "Manual authentication was detected automatically."
+                    )
                     return current
 
             except Exception:
@@ -762,6 +874,11 @@ async def wait_for_manual_login(context: BrowserContext) -> Page:
 
 
 async def minimize_browser(page: Page) -> None:
+    """
+    Minimize the visible Chromium browser where supported.
+
+    Failure is non-fatal because desktop environments differ.
+    """
     try:
         cdp = await page.context.new_cdp_session(page)
         window = await cdp.send("Browser.getWindowForTarget")
@@ -779,7 +896,8 @@ async def minimize_browser(page: Page) -> None:
 
     except Exception as exc:
         log(
-            "Could not minimize the browser automatically: {}.".format(exc)
+            "Could not minimize the browser automatically: {}. "
+            "The watcher will continue.".format(exc)
         )
 
 
@@ -789,7 +907,10 @@ async def load_all_rows(page: Page) -> int:
     stable_rounds = 0
 
     while stable_rounds < ROW_STABILITY_ROUNDS:
-        total = await page.locator("{} tr".format(selector)).count()
+        total = await page.locator(
+            "{} tr".format(selector)
+        ).count()
+
         count = max(0, total - 1)
 
         if count == last_count:
@@ -801,10 +922,14 @@ async def load_all_rows(page: Page) -> int:
         await page.evaluate(
             """
             () => {
-                window.scrollTo(0, document.documentElement.scrollHeight);
+                window.scrollTo(
+                    0,
+                    document.documentElement.scrollHeight
+                );
 
                 for (const element of document.querySelectorAll("*")) {
                     const style = getComputedStyle(element);
+
                     const canScroll =
                         /(auto|scroll)/.test(style.overflowY) &&
                         element.scrollHeight > element.clientHeight;
@@ -820,7 +945,12 @@ async def load_all_rows(page: Page) -> int:
         await page.wait_for_timeout(800)
 
     await page.evaluate("window.scrollTo(0, 0)")
-    log("Grades table stabilized at {} data row(s).".format(last_count))
+    log(
+        "Grades table stabilized at {} data row(s).".format(
+            last_count
+        )
+    )
+
     return last_count
 
 
@@ -829,7 +959,9 @@ async def extract_grade_rows(page: Page) -> List[Dict[str, str]]:
     table = page.locator(selector).first
 
     if await table.count() == 0:
-        raise RuntimeError("The BIU grades table was not found.")
+        raise RuntimeError(
+            "The BIU grades table was not found."
+        )
 
     await load_all_rows(page)
 
@@ -842,7 +974,9 @@ async def extract_grade_rows(page: Page) -> List[Dict[str, str]]:
                     .replace(/\\s+/g, " ")
                     .trim();
 
-            const allRows = Array.from(table.querySelectorAll("tr"));
+            const allRows = Array.from(
+                table.querySelectorAll("tr")
+            );
 
             if (allRows.length === 0) {
                 return { headers: [], rows: [] };
@@ -854,31 +988,46 @@ async def extract_grade_rows(page: Page) -> List[Dict[str, str]]:
 
             let headers = Array.from(
                 headerRow.querySelectorAll("th, td")
-            ).map(cell => clean(cell.innerText || cell.textContent));
+            ).map(
+                cell => clean(
+                    cell.innerText || cell.textContent
+                )
+            );
 
             const dataRows = allRows.filter(row => {
-                if (row === headerRow) return false;
+                if (row === headerRow) {
+                    return false;
+                }
 
-                if (row.querySelectorAll(":scope > td").length === 0) {
+                if (
+                    row.querySelectorAll(":scope > td").length === 0
+                ) {
                     return false;
                 }
 
                 const cls = row.className || "";
 
-                return /GridRow|AlternatingRow|GridAlternatingRow/i.test(cls)
+                return (
+                    /GridRow|AlternatingRow|GridAlternatingRow/i
+                        .test(cls)
                     || row.querySelector(
                         "span[id*='gvStudentAssignmentTermList_']"
                     )
                     || row.querySelector(
                         "input[id*='gvStudentAssignmentTermList_']"
-                    );
+                    )
+                );
             });
 
             const rows = dataRows.map(row => {
-                const cells = Array.from(row.querySelectorAll(":scope > td"));
+                const cells = Array.from(
+                    row.querySelectorAll(":scope > td")
+                );
 
                 const values = cells.map(
-                    cell => clean(cell.innerText || cell.textContent)
+                    cell => clean(
+                        cell.innerText || cell.textContent
+                    )
                 );
 
                 if (headers.length < values.length) {
@@ -899,10 +1048,17 @@ async def extract_grade_rows(page: Page) -> List[Dict[str, str]]:
 
                 values.forEach((value, index) => {
                     let header =
-                        headers[index] || ("Column " + (index + 1));
+                        headers[index]
+                        || ("Column " + (index + 1));
 
-                    if (Object.prototype.hasOwnProperty.call(record, header)) {
-                        header = header + " #" + (index + 1);
+                    if (
+                        Object.prototype.hasOwnProperty.call(
+                            record,
+                            header
+                        )
+                    ) {
+                        header =
+                            header + " #" + (index + 1);
                     }
 
                     record[header] = value;
@@ -934,12 +1090,17 @@ async def extract_grade_rows(page: Page) -> List[Dict[str, str]]:
 
     if not rows:
         raise RuntimeError(
-            "The grades table was found, but no rows were extracted."
+            "The grades table was found, "
+            "but no rows were extracted."
         )
 
-    if not any(is_grade_header(header) for header in headers):
+    if not any(
+        is_grade_header(header)
+        for header in headers
+    ):
         raise RuntimeError(
-            "The grades table was found, but no grade column was identified."
+            "The grades table was found, "
+            "but no grade column was identified."
         )
 
     return rows
@@ -955,22 +1116,26 @@ async def perform_check(
         )
 
     except PlaywrightTimeoutError:
-        log("Page reload timed out. Inspecting the current page.")
+        log(
+            "Page reload timed out. "
+            "Inspecting the current page."
+        )
 
     if not await table_exists(page):
         raise RuntimeError(
-            "The BIU session expired or the grades table is unavailable."
+            "The BIU session expired or "
+            "the grades table is unavailable."
         )
 
     rows = await extract_grade_rows(page)
-    previous = registry_read_snapshot()
+    previous = read_snapshot()
 
     if previous is None:
-        registry_write_snapshot(rows)
+        write_snapshot(rows)
         return rows, [], True
 
     changes = compare_snapshots(previous, rows)
-    registry_write_snapshot(rows)
+    write_snapshot(rows)
 
     return rows, changes, False
 
@@ -980,11 +1145,6 @@ async def keepalive_loop(
     stop_event: asyncio.Event,
     interval_minutes: int,
 ) -> None:
-    """
-    Keep the BIU server session active independently from grade checks.
-
-    context.request shares cookies with the browser context.
-    """
     interval_seconds = interval_minutes * 60
 
     while not stop_event.is_set():
@@ -1017,38 +1177,57 @@ async def keepalive_loop(
                 )
 
         except Exception as exc:
-            log("BIU session keepalive failed: {}".format(exc))
+            log(
+                "BIU session keepalive failed: {}".format(exc)
+            )
 
 
-def make_popup_message(changes: List[str]) -> str:
+def make_notification_message(
+    changes: List[str],
+) -> str:
     message = "\n\n".join(changes[:6])
 
     if len(changes) > 6:
-        message += "\n\nAnd {} more change(s).".format(len(changes) - 6)
+        message += "\n\nAnd {} more change(s).".format(
+            len(changes) - 6
+        )
 
     if len(message) > 3500:
-        message = message[:3500] + "\n\n[Message truncated]"
+        message = (
+            message[:3500]
+            + "\n\n[Message truncated]"
+        )
 
     return message
 
 
 async def run(args: argparse.Namespace) -> int:
-    dotenv_path = Path(args.env_file).expanduser().resolve()
+    dotenv_path = Path(
+        args.env_file
+    ).expanduser().resolve()
+
     load_dotenv_file(dotenv_path)
 
-    auth_method = resolve_auth_method(args.auth_method)
-    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    auth_method = resolve_auth_method(
+        args.auth_method
+    )
 
-    # Direct login is fully headless.
-    # My-BIU remains visible because it is a manual interactive flow.
+    PROFILE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
     headless = auth_method == "direct"
 
     async with async_playwright() as playwright:
         log("Starting the BIU browser session.")
+        log("Operating system: {}.".format(platform.system()))
         log("Authentication method: {}.".format(auth_method))
-        log("Browser mode: {}.".format(
-            "headless" if headless else "visible"
-        ))
+        log(
+            "Browser mode: {}.".format(
+                "headless" if headless else "visible"
+            )
+        )
 
         context = await playwright.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
@@ -1056,7 +1235,9 @@ async def run(args: argparse.Namespace) -> int:
             viewport={"width": 1440, "height": 1000},
             locale="he-IL",
             timezone_id="Asia/Jerusalem",
-            args=["--disable-blink-features=AutomationControlled"],
+            args=[
+                "--disable-blink-features=AutomationControlled"
+            ],
         )
 
         stop_event = asyncio.Event()
@@ -1066,14 +1247,20 @@ async def run(args: argparse.Namespace) -> int:
             page = await choose_page(context)
             await navigate(page, TARGET_URL)
 
-            if not args.force_login and await table_exists(page):
+            if (
+                not args.force_login
+                and await table_exists(page)
+            ):
                 log("The existing BIU session is valid.")
 
             elif auth_method == "direct":
                 page = await direct_login_headless(page)
 
             else:
-                log('Opening the "My Bar-Ilan" portal.')
+                log(
+                    'Opening the "My Bar-Ilan" portal.'
+                )
+
                 await navigate(page, MY_BIU_URL)
                 page = await wait_for_manual_login(context)
                 await minimize_browser(page)
@@ -1087,32 +1274,39 @@ async def run(args: argparse.Namespace) -> int:
             )
 
             while True:
-                log("Checking BIU In-Bar for new grades now.")
+                log(
+                    "Checking BIU In-Bar "
+                    "for new grades now."
+                )
 
                 try:
-                    rows, changes, initialized = await perform_check(page)
+                    rows, changes, initialized = (
+                        await perform_check(page)
+                    )
 
                     if initialized:
                         log(
-                            "Initial snapshot saved successfully: {} rows. "
-                            "No popup was generated.".format(len(rows))
+                            "Initial snapshot saved successfully: "
+                            "{} rows. No notification was generated."
+                            .format(len(rows))
                         )
 
                     elif changes:
                         log(
-                            "{} grade change(s) detected.".format(len(changes))
+                            "{} grade change(s) detected."
+                            .format(len(changes))
                         )
 
-                        windows_popup(
+                        desktop_notification(
                             "BIU In-Bar grade update",
-                            make_popup_message(changes),
+                            make_notification_message(changes),
                         )
 
                     else:
                         log(
-                            "Check completed: {} rows, no new grades.".format(
-                                len(rows)
-                            )
+                            "Check completed: {} rows, "
+                            "no new grades."
+                            .format(len(rows))
                         )
 
                     if args.print_rows:
@@ -1125,13 +1319,25 @@ async def run(args: argparse.Namespace) -> int:
                         )
 
                 except Exception as exc:
-                    log("The current BIU session failed: {}".format(exc))
+                    log(
+                        "The current BIU session failed: {}"
+                        .format(exc)
+                    )
 
                     if auth_method == "direct":
-                        log("Re-authenticating in headless direct-login mode.")
+                        log(
+                            "Re-authenticating in "
+                            "headless direct-login mode."
+                        )
+
                         page = await direct_login_headless(page)
+
                     else:
-                        log("Manual authentication is required again.")
+                        log(
+                            "Manual authentication "
+                            "is required again."
+                        )
+
                         await navigate(page, MY_BIU_URL)
                         page = await wait_for_manual_login(context)
                         await minimize_browser(page)
@@ -1142,12 +1348,14 @@ async def run(args: argparse.Namespace) -> int:
                     return 0
 
                 log(
-                    "Waiting {} minute(s) before the next grade check.".format(
-                        args.interval
-                    )
+                    "Waiting {} minute(s) "
+                    "before the next grade check."
+                    .format(args.interval)
                 )
 
-                await asyncio.sleep(args.interval * 60)
+                await asyncio.sleep(
+                    args.interval * 60
+                )
 
         finally:
             stop_event.set()
@@ -1157,6 +1365,7 @@ async def run(args: argparse.Namespace) -> int:
 
                 try:
                     await keepalive_task
+
                 except asyncio.CancelledError:
                     pass
 
@@ -1165,7 +1374,10 @@ async def run(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Monitor BIU In-Bar for new or changed grades."
+        description=(
+            "Monitor BIU In-Bar "
+            "for new or changed grades."
+        )
     )
 
     parser.add_argument(
@@ -1179,9 +1391,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_INTERVAL_MINUTES,
         help=(
-            "Grade-check interval in minutes. Default: {}.".format(
-                DEFAULT_INTERVAL_MINUTES
-            )
+            "Grade-check interval in minutes. "
+            "Default: {}."
+            .format(DEFAULT_INTERVAL_MINUTES)
         ),
     )
 
@@ -1190,9 +1402,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_KEEPALIVE_MINUTES,
         help=(
-            "BIU session keepalive interval in minutes. Default: {}.".format(
-                DEFAULT_KEEPALIVE_MINUTES
-            )
+            "BIU session keepalive interval in minutes. "
+            "Default: {}."
+            .format(DEFAULT_KEEPALIVE_MINUTES)
         ),
     )
 
@@ -1200,56 +1412,80 @@ def parse_args() -> argparse.Namespace:
         "--auth-method",
         choices=("direct", "my-biu"),
         help=(
-            "Authentication method. If omitted, an interactive menu is shown."
+            "Authentication method. "
+            "If omitted, an interactive menu is shown."
         ),
     )
 
     parser.add_argument(
         "--force-login",
         action="store_true",
-        help="Force the selected authentication flow.",
+        help=(
+            "Force the selected authentication flow."
+        ),
     )
 
     parser.add_argument(
         "--env-file",
         default=".env",
-        help="Path to the optional .env file. Default: .env",
+        help=(
+            "Path to the optional .env file. "
+            "Default: .env"
+        ),
     )
 
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="Reset the saved grade snapshot and exit.",
+        help=(
+            "Reset the saved grade snapshot and exit."
+        ),
     )
 
     parser.add_argument(
         "--print-rows",
         action="store_true",
-        help="Print all extracted grade rows as JSON.",
+        help=(
+            "Print all extracted grade rows as JSON."
+        ),
     )
 
     args = parser.parse_args()
 
     if args.interval < 1:
-        parser.error("--interval must be at least 1 minute")
+        parser.error(
+            "--interval must be at least 1 minute"
+        )
 
     if args.keepalive < 1:
-        parser.error("--keepalive must be at least 1 minute")
-
-    if args.keepalive >= args.interval and not args.once:
         parser.error(
-            "--keepalive should be shorter than --interval "
-            "for continuous monitoring"
+            "--keepalive must be at least 1 minute"
+        )
+
+    if (
+        args.keepalive >= args.interval
+        and not args.once
+    ):
+        parser.error(
+            "--keepalive should be shorter than "
+            "--interval for continuous monitoring"
         )
 
     return args
 
 
 def main() -> int:
+    if PLATFORM == "unsupported":
+        print(
+            "Unsupported operating system: {}"
+            .format(platform.system())
+        )
+        return 1
+
     args = parse_args()
 
     if args.reset:
-        registry_reset()
+        reset_snapshot()
         return 0
 
     try:
@@ -1260,13 +1496,20 @@ def main() -> int:
         return 130
 
     except Exception as exc:
-        log("Fatal error: {}\n{}".format(exc, traceback.format_exc()))
+        log(
+            "Fatal error: {}\n{}"
+            .format(
+                exc,
+                traceback.format_exc(),
+            )
+        )
 
         try:
-            windows_popup(
+            desktop_notification(
                 "BIU Grade Watcher error",
                 "The watcher stopped:\n{}".format(exc),
             )
+
         except Exception:
             pass
 
