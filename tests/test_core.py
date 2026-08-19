@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -8,7 +9,11 @@ from unittest import mock
 
 from watcher import reliability as reliability_module
 from watcher.errors import CircuitOpen, ProtectionEvent
-from watcher.reliability import ProtectionController
+from watcher.reliability import (
+    AuthenticationBudget,
+    ProtectionController,
+    RequestGate,
+)
 from watcher.utils import normalize_text, parse_retry_after, utc_iso, utc_now
 
 
@@ -107,6 +112,70 @@ class ProtectionControllerTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(CircuitOpen):
             await self.controller.prepare_activity(allow_recovery_probe=False)
+
+    async def test_expired_open_circuit_enters_half_open_for_recovery(self) -> None:
+        self.controller.state.circuit_state = "OPEN"
+        self.controller.state.last_reason = "cooldown complete"
+        self.controller.state.cooldown_until = utc_iso(
+            utc_now() - timedelta(seconds=1)
+        )
+        self.controller.save()
+
+        await self.controller.prepare_activity(allow_recovery_probe=True)
+
+        self.assertEqual(self.controller.state.circuit_state, "HALF_OPEN")
+        with self.assertRaises(CircuitOpen):
+            await self.controller.prepare_activity(allow_recovery_probe=False)
+
+    async def test_protection_notifications_are_throttled(self) -> None:
+        self.assertTrue(await self.controller.should_notify())
+        self.assertFalse(await self.controller.should_notify())
+
+
+class AuthenticationBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reauthentication_too_soon_is_rejected(self) -> None:
+        budget = AuthenticationBudget()
+        budget.record_or_raise(initial_login=True)
+
+        with self.assertRaises(ProtectionEvent) as caught:
+            budget.record_or_raise(initial_login=False)
+
+        self.assertEqual(caught.exception.kind, "rate_limit")
+        self.assertIsNotNone(caught.exception.retry_after_seconds)
+        self.assertGreater(caught.exception.retry_after_seconds, 0)
+
+    async def test_hourly_authentication_budget_is_enforced(self) -> None:
+        budget = AuthenticationBudget()
+        budget.record_or_raise(initial_login=True)
+        budget.record_or_raise(initial_login=True)
+
+        with self.assertRaises(ProtectionEvent) as caught:
+            budget.record_or_raise(initial_login=True)
+
+        self.assertEqual(caught.exception.kind, "rate_limit")
+        self.assertEqual(caught.exception.retry_after_seconds, 60 * 60)
+
+
+class RequestGateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gate_serializes_concurrent_top_level_operations(self) -> None:
+        gate = RequestGate(minimum_gap_seconds=0, maximum_requests_per_hour=10)
+        active = 0
+        max_active = 0
+        entered: list[str] = []
+
+        async def worker(label: str) -> None:
+            nonlocal active, max_active
+            async with gate.slot(label):
+                active += 1
+                max_active = max(max_active, active)
+                entered.append(label)
+                await asyncio.sleep(0)
+                active -= 1
+
+        await asyncio.gather(worker("first"), worker("second"))
+
+        self.assertEqual(max_active, 1)
+        self.assertCountEqual(entered, ["first", "second"])
 
 
 if __name__ == "__main__":
