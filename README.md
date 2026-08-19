@@ -34,6 +34,8 @@ flowchart TD
 
 The project intentionally separates **request permission** from **request execution**: the request gate controls pacing and serialization, while the protection controller decides whether activity is allowed at all.
 
+The implementation is also separated by responsibility: browser/session integration is isolated from reliability state, snapshot comparison, configuration, notifications, and runtime orchestration. `biu_grade_watcher.py` remains a thin compatibility CLI so existing commands and imports continue to work.
+
 ---
 
 ## Reliability Model
@@ -103,16 +105,24 @@ Transient failures use exponential backoff. Explicit protection events open the 
 
 ```text
 whenTheAnswer/
-├── biu_grade_watcher.py     # watcher, browser flow, pacing and reliability controls
-├── tests/                   # deterministic tests for reliability primitives
-├── .github/workflows/ci.yml # cross-version Python validation
-├── env.example              # local configuration template
+├── biu_grade_watcher.py      # thin CLI + compatibility import surface
+├── watcher/
+│   ├── config.py             # constants, paths, safety limits
+│   ├── errors.py             # typed failure/protection events
+│   ├── reliability.py        # lock, request gate, auth budget, circuit breaker
+│   ├── snapshot.py           # grade identity, persistence, diffing
+│   ├── browser.py            # Playwright auth/navigation/extraction boundary
+│   ├── runtime.py            # watcher orchestration + keepalive loop
+│   └── utils.py              # logging, notifications, JSON/time helpers
+├── tests/                    # deterministic reliability tests
+├── .github/workflows/ci.yml  # cross-version Python validation
+├── env.example               # local configuration template
 ├── requirements.txt
 ├── LICENSE
 └── README.md
 ```
 
-The runtime is currently kept in one main Python module. The reliability primitives are structured as explicit classes/functions inside that module so their behavior can be exercised independently of real browser navigation.
+This split keeps deterministic reliability and state-management logic independent from the live browser integration. The external-site boundary remains in `watcher/browser.py`, while orchestration is coordinated from `watcher/runtime.py`.
 
 ---
 
@@ -298,7 +308,8 @@ The script refuses a grade interval below 5 minutes, a keepalive interval below 
 - **Persist failure state**: process restarts should not erase safety behavior.
 - **Serialize recovery**: recovery should happen through one controlled workflow.
 - **Fail visibly**: protection state, reason, status and cooldown remain inspectable.
-- **Test deterministic logic separately**: reliability primitives should be testable without external network dependencies.
+- **Separate external I/O from deterministic logic**: browser behavior is isolated from state, pacing, and snapshot rules.
+- **Keep compatibility at the boundary**: the original CLI remains stable while internals are modularized.
 
 ---
 
@@ -306,7 +317,7 @@ The script refuses a grade interval below 5 minutes, a keepalive interval below 
 
 - Live browser behavior depends on an external university website and can change independently of this repository.
 - Authentication and full end-to-end browser integration cannot be reproduced in public CI without real credentials and live external access.
-- The main runtime remains a large single module; further modularization would improve separation between browser integration, persistence, pacing, and notification adapters.
+- Browser selectors and authentication flows remain coupled to the current BIU site and require maintenance when the external UI changes.
 - This is a personal monitoring utility, not an official BIU integration.
 
 ---
